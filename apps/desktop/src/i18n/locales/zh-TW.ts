@@ -730,6 +730,7 @@
     stopping: "正在停止……",
     close: "關閉",
     more: "更多",
+    done: "完成",
   },
   explain: {
     title: "執行計畫",

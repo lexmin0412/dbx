@@ -691,6 +691,7 @@
     stopping: "Deteniendo...",
     close: "Cerrar",
     more: "Más",
+    done: "Listo",
   },
   explain: {
     title: "Plan de ejecución",

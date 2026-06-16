@@ -751,6 +751,7 @@
     stopping: "Interruzione...",
     close: "Chiudi",
     more: "Altro",
+    done: "Fatto",
   },
   explain: {
     title: "Piano di Spiegazione",

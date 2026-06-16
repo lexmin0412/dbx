@@ -804,6 +804,7 @@
     cancel: "Cancel",
     save: "Save",
     more: "More",
+    done: "Done",
   },
   explain: {
     title: "Explain Plan",

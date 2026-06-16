@@ -751,6 +751,7 @@
     stopping: "Parando...",
     close: "Fechar",
     more: "Mais",
+    done: "Concluído",
   },
   explain: {
     title: "Plano de Execução",

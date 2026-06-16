@@ -803,6 +803,7 @@
     cancel: "取消",
     save: "保存",
     more: "更多",
+    done: "完成",
   },
   explain: {
     title: "执行计划",
