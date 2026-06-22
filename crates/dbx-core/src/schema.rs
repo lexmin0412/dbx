@@ -35,16 +35,6 @@ macro_rules! try_sqlserver {
     };
 }
 
-macro_rules! try_agent {
-    ($connections:expr, $pool_key:expr, $method:ident $(, $arg:expr)*) => {
-        if let Some(client) = extract_pool!(&$connections, $pool_key, Agent) {
-            drop($connections);
-            let mut client = client.lock().await;
-            return client.$method($($arg),*).await;
-        }
-    };
-}
-
 #[cfg(feature = "duckdb-bundled")]
 pub fn duckdb_query_tables(con: &duckdb::Connection) -> Result<Vec<db::TableInfo>, String> {
     duckdb_query_tables_in_database(con, "main", "main")
@@ -268,6 +258,16 @@ fn clickhouse_metadata_database<'a>(database: &'a str, schema: &'a str) -> &'a s
     }
 }
 
+fn agent_metadata_timeout(config: Option<&ConnectionConfig>) -> Option<Duration> {
+    let Some(config) = config else {
+        return Some(Duration::from_secs(60));
+    };
+    match config.effective_query_timeout_secs() {
+        0 => None,
+        seconds => Some(Duration::from_secs(seconds.max(60))),
+    }
+}
+
 pub async fn list_databases_core(state: &AppState, connection_id: &str) -> Result<Vec<db::DatabaseInfo>, String> {
     retry_metadata_connection(state, connection_id, None, || list_databases_once(state, connection_id)).await
 }
@@ -336,6 +336,7 @@ pub async fn list_sqlserver_linked_server_tables_core(
 
 async fn list_databases_once(state: &AppState, connection_id: &str) -> Result<Vec<db::DatabaseInfo>, String> {
     log::info!("[list_databases] connection_id={connection_id}");
+    let db_config = connection_config(state, connection_id).await;
     {
         let connections = state.connections.read().await;
         #[cfg(feature = "duckdb-bundled")]
@@ -369,7 +370,7 @@ async fn list_databases_once(state: &AppState, connection_id: &str) -> Result<Ve
             }
             drop(connections);
             let mut client = client.lock().await;
-            return client.list_databases().await;
+            return client.list_databases(agent_metadata_timeout(db_config.as_ref())).await;
         }
     }
 
@@ -427,7 +428,7 @@ async fn list_schemas_once(state: &AppState, connection_id: &str, database: &str
             let fallback_config = db_config.clone();
             drop(connections);
             let mut client = client.lock().await;
-            match client.list_schemas::<Vec<String>>(database).await {
+            match client.list_schemas::<Vec<String>>(database, agent_metadata_timeout(db_config.as_ref())).await {
                 Ok(schemas) if !schemas.is_empty() => return Ok(schemas),
                 Ok(schemas) => {
                     if let Some(config) = fallback_config.as_ref() {
@@ -584,7 +585,10 @@ async fn list_tables_once(
             let fallback_config = db_config.clone();
             drop(connections);
             let mut client = client.lock().await;
-            match client.list_tables::<Vec<db::TableInfo>>(database, schema).await {
+            match client
+                .list_tables::<Vec<db::TableInfo>>(database, schema, agent_metadata_timeout(db_config.as_ref()))
+                .await
+            {
                 Ok(tables) if !tables.is_empty() => {
                     return Ok(filter_table_infos(tables, filter, limit, offset, object_types))
                 }
@@ -990,6 +994,20 @@ mod tests {
         assert!(!is_agent_postgres_metadata_fallback_config(&test_connection_config(DatabaseType::Postgres)));
         assert!(!is_agent_postgres_metadata_fallback_config(&test_connection_config(DatabaseType::Mysql)));
     }
+
+    #[test]
+    fn agent_metadata_timeout_defaults_to_sixty_seconds_and_honors_longer_config() {
+        assert_eq!(super::agent_metadata_timeout(None), Some(std::time::Duration::from_secs(60)));
+
+        let mut config = test_connection_config(DatabaseType::Oracle);
+        assert_eq!(super::agent_metadata_timeout(Some(&config)), Some(std::time::Duration::from_secs(60)));
+
+        config.query_timeout_secs = 120;
+        assert_eq!(super::agent_metadata_timeout(Some(&config)), Some(std::time::Duration::from_secs(120)));
+
+        config.query_timeout_secs = 0;
+        assert_eq!(super::agent_metadata_timeout(Some(&config)), None);
+    }
 }
 
 pub async fn list_objects_core(
@@ -1104,10 +1122,14 @@ async fn list_objects_once(
             let fallback_config = db_config.clone();
             drop(connections);
             if is_oracle {
-                return oracle_agent_list_objects(client, database, schema).await;
+                return oracle_agent_list_objects(client, database, schema, agent_metadata_timeout(db_config.as_ref()))
+                    .await;
             }
             let mut client = client.lock().await;
-            match client.list_objects::<Vec<db::ObjectInfo>>(database, schema).await {
+            match client
+                .list_objects::<Vec<db::ObjectInfo>>(database, schema, agent_metadata_timeout(db_config.as_ref()))
+                .await
+            {
                 Ok(objects) if !objects.is_empty() => return Ok(objects),
                 Ok(objects) => {
                     if let Some(config) = fallback_config.as_ref() {
@@ -1210,10 +1232,13 @@ async fn list_completion_objects_once(
         let fallback_config = db_config.clone();
         drop(connections);
         let objects = if is_oracle {
-            oracle_agent_list_objects(client, database, schema).await?
+            oracle_agent_list_objects(client, database, schema, agent_metadata_timeout(db_config.as_ref())).await?
         } else {
             let mut client = client.lock().await;
-            match client.list_objects::<Vec<db::ObjectInfo>>(database, schema).await {
+            match client
+                .list_objects::<Vec<db::ObjectInfo>>(database, schema, agent_metadata_timeout(db_config.as_ref()))
+                .await
+            {
                 Ok(objects) if !objects.is_empty() => objects,
                 Ok(objects) => {
                     if let Some(config) = fallback_config.as_ref() {
@@ -1418,7 +1443,15 @@ pub async fn get_columns_core(
                 let fallback_config = db_config.clone();
                 drop(connections);
                 let mut client = client.lock().await;
-                match client.get_columns::<Vec<db::ColumnInfo>>(database, schema, table).await {
+                match client
+                    .get_columns::<Vec<db::ColumnInfo>>(
+                        database,
+                        schema,
+                        table,
+                        agent_metadata_timeout(db_config.as_ref()),
+                    )
+                    .await
+                {
                     Ok(columns) if !columns.is_empty() => return Ok(deduplicate_column_infos(columns)),
                     Ok(columns) => {
                         if let Some(config) = fallback_config.as_ref() {
@@ -1554,7 +1587,11 @@ pub async fn list_indexes_core(
         {
             let connections = state.connections.read().await;
             try_sqlserver!(connections, &pool_key, list_indexes, schema, table);
-            try_agent!(connections, &pool_key, list_indexes, database, schema, table);
+            if let Some(client) = extract_pool!(&connections, &pool_key, Agent) {
+                drop(connections);
+                let mut client = client.lock().await;
+                return client.list_indexes(database, schema, table, agent_metadata_timeout(db_config.as_ref())).await;
+            }
         }
 
         let connections = state.connections.read().await;
@@ -1592,11 +1629,18 @@ pub async fn list_foreign_keys_core(
     }
     retry_metadata_connection(state, connection_id, Some(database), || async {
         let pool_key = state.get_or_create_pool(connection_id, Some(database)).await?;
+        let db_config = connection_config(state, connection_id).await;
 
         {
             let connections = state.connections.read().await;
             try_sqlserver!(connections, &pool_key, list_foreign_keys, schema, table);
-            try_agent!(connections, &pool_key, list_foreign_keys, database, schema, table);
+            if let Some(client) = extract_pool!(&connections, &pool_key, Agent) {
+                drop(connections);
+                let mut client = client.lock().await;
+                return client
+                    .list_foreign_keys(database, schema, table, agent_metadata_timeout(db_config.as_ref()))
+                    .await;
+            }
         }
 
         let connections = state.connections.read().await;
@@ -1627,11 +1671,16 @@ pub async fn list_triggers_core(
     }
     retry_metadata_connection(state, connection_id, Some(database), || async {
         let pool_key = state.get_or_create_pool(connection_id, Some(database)).await?;
+        let db_config = connection_config(state, connection_id).await;
 
         {
             let connections = state.connections.read().await;
             try_sqlserver!(connections, &pool_key, list_triggers, schema, table);
-            try_agent!(connections, &pool_key, list_triggers, database, schema, table);
+            if let Some(client) = extract_pool!(&connections, &pool_key, Agent) {
+                drop(connections);
+                let mut client = client.lock().await;
+                return client.list_triggers(database, schema, table, agent_metadata_timeout(db_config.as_ref())).await;
+            }
         }
 
         let connections = state.connections.read().await;
@@ -1751,6 +1800,7 @@ pub async fn get_table_ddl_core(
     }
 
     let pool_key = state.get_or_create_pool(connection_id, Some(database)).await?;
+    let db_config = connection_config(state, connection_id).await;
 
     {
         let connections = state.connections.read().await;
@@ -1790,12 +1840,15 @@ pub async fn get_table_ddl_core(
             let mut client = client.lock().await;
             return build_sqlserver_ddl(&mut client, schema, table).await;
         }
-        try_agent!(connections, &pool_key, get_table_ddl, database, schema, table);
+        if let Some(client) = extract_pool!(&connections, &pool_key, Agent) {
+            drop(connections);
+            let mut client = client.lock().await;
+            return client.get_table_ddl(database, schema, table, agent_metadata_timeout(db_config.as_ref())).await;
+        }
     }
 
     let connections = state.connections.read().await;
     let pool = connections.get(&pool_key).ok_or("Pool not found")?;
-    let db_config = connection_config(state, connection_id).await;
 
     match pool {
         PoolKind::Mysql(p, _) => mysql_ddl(p, table).await,
@@ -2099,10 +2152,20 @@ pub async fn get_object_source_core(
             if db_config.as_ref().is_some_and(|config| config.db_type == DatabaseType::Oracle)
                 && matches!(object_type, db::ObjectSourceKind::Package | db::ObjectSourceKind::PackageBody)
             {
-                oracle_agent_object_source(client, database, schema, name, &object_type).await?
+                oracle_agent_object_source(
+                    client,
+                    database,
+                    schema,
+                    name,
+                    &object_type,
+                    agent_metadata_timeout(db_config.as_ref()),
+                )
+                .await?
             } else {
                 let mut client = client.lock().await;
-                let result: db::ObjectSource = client.get_object_source(database, schema, name, &object_type).await?;
+                let result: db::ObjectSource = client
+                    .get_object_source(database, schema, name, &object_type, agent_metadata_timeout(db_config.as_ref()))
+                    .await?;
                 return Ok(result);
             }
         } else {
@@ -2164,6 +2227,7 @@ async fn oracle_agent_list_objects(
     client: Arc<tokio::sync::Mutex<db::agent_driver::AgentDriverClient>>,
     database: &str,
     schema: &str,
+    timeout_duration: Option<Duration>,
 ) -> Result<Vec<db::ObjectInfo>, String> {
     let sql = oracle_list_objects_sql(schema);
     let params = agent_execute_query_params(
@@ -2173,7 +2237,7 @@ async fn oracle_agent_list_objects(
         QueryExecutionOptions { max_rows: Some(10_000), ..Default::default() },
     );
     let mut client = client.lock().await;
-    let result: db::QueryResult = client.execute_query(params).await?;
+    let result: db::QueryResult = client.execute_query_with_timeout(params, timeout_duration).await?;
     Ok(result
         .rows
         .into_iter()
@@ -2201,6 +2265,7 @@ async fn oracle_agent_object_source(
     schema: &str,
     name: &str,
     object_type: &db::ObjectSourceKind,
+    timeout_duration: Option<Duration>,
 ) -> Result<String, String> {
     let sql = oracle_object_source_sql(schema, name, object_type);
     let params = agent_execute_query_params(
@@ -2210,7 +2275,7 @@ async fn oracle_agent_object_source(
         QueryExecutionOptions { max_rows: Some(1), ..Default::default() },
     );
     let mut client = client.lock().await;
-    let result: db::QueryResult = client.execute_query(params).await?;
+    let result: db::QueryResult = client.execute_query_with_timeout(params, timeout_duration).await?;
     first_string_cell(result)
 }
 

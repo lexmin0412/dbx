@@ -10,7 +10,7 @@ import SqlExecutionTargetPicker from "./SqlExecutionTargetPicker.vue";
 import CustomContextMenu, { type ContextMenuItem } from "@/components/ui/CustomContextMenu.vue";
 import { copyToClipboard } from "@/lib/clipboard";
 import { resolveExecutableSql, type SqlExecutionSnapshot, type SqlExecutionOverride, type SqlExecutionCandidate } from "@/lib/sqlExecutionTarget";
-import { buildExecutionCandidates, supportsExecutionTargetPicker } from "@/lib/sqlStatementRanges";
+import { buildExecutionCandidates, hasMultipleExecutionTargets, supportsExecutionTargetPicker } from "@/lib/sqlStatementRanges";
 import { formatSqlText, type SqlFormatDialect } from "@/lib/sqlFormatter";
 import { formatMongoShellText } from "@/lib/mongoFormatter";
 import { useConnectionStore } from "@/stores/connectionStore";
@@ -38,6 +38,7 @@ import { clampEditorFontSize, createEditorZoomCommitScheduler, fontSizeFromGestu
 import { normalizeShortcutSettings, shortcutToCodeMirrorKey } from "@/lib/shortcutRegistry";
 import { trimmedSelectionLayer } from "@/lib/codemirrorTrimmedSelectionLayer";
 import { selectionMatchOccurrences } from "@/lib/codemirrorSelectionMatches";
+import { createDbxCodeMirrorSqlDialect } from "@/lib/codemirrorSqlDialect";
 import { isSchemaAware, isSingleDatabase } from "@/lib/databaseFeatureSupport";
 import { qualifiedTableNameAtSqlPosition } from "@/lib/queryCursorTableTarget";
 import * as api from "@/lib/api";
@@ -319,7 +320,7 @@ function requestExecute() {
   const cursorPos = selection.head;
   const candidates = buildExecutionCandidates(doc, cursorPos, props.databaseType);
   if (candidates.length === 0) return false;
-  if (!settingsStore.editorSettings.showExecutionTargetPicker) {
+  if (!settingsStore.editorSettings.showExecutionTargetPicker || !hasMultipleExecutionTargets(doc, props.databaseType)) {
     const preferredKind = settingsStore.editorSettings.executeMode === "current" ? "cursor" : "all";
     const candidate = candidates.find((item) => item.kind === preferredKind) ?? candidates[0];
     emit("execute", candidate.sql);
@@ -1675,7 +1676,7 @@ onMounted(async () => {
   const [
     { EditorView, keymap, rectangularSelection, hoverTooltip, showTooltip, Decoration, tooltips, lineNumbers, highlightActiveLineGutter, highlightSpecialChars, drawSelection, dropCursor, crosshairCursor, ViewPlugin },
     { EditorState, Compartment, Prec, StateEffect, StateField },
-    { sql, MSSQL, MySQL, PostgreSQL, SQLDialect },
+    langSql,
     { autocompletion, startCompletion, acceptCompletion, closeBrackets, closeBracketsKeymap, snippetCompletion, completionStatus, completionKeymap },
     { copyLineDown, copyLineUp, deleteLine, indentLess, indentMore, insertNewlineKeepIndent, moveLineDown, moveLineUp, redo, selectAll, undo, history, defaultKeymap, historyKeymap },
     { bracketMatching, foldGutter, indentOnInput, syntaxHighlighting, defaultHighlightStyle, foldKeymap },
@@ -1791,22 +1792,7 @@ onMounted(async () => {
       override: [async (context: CompletionContext) => provideSqlCompletions(context.state, context.pos, context.explicit)],
     });
 
-  const baseDialect = props.dialect === "postgres" ? PostgreSQL : props.dialect === "sqlserver" ? MSSQL : MySQL;
-  const extraKeywords = "PIVOT UNPIVOT EXCLUDE REPLACE QUALIFY ASOF POSITIONAL ANTI SEMI SAMPLE TABLESAMPLE STRUCT MAP LIST ARRAY LAMBDA UNNEST LATERAL FILTER RECURSIVE SUMMARIZE PRAGMA READ_CSV READ_PARQUET READ_JSON DESCRIBE SHOW COPY EXPORT IMPORT";
-
-  // PL/pgSQL extension: add procedural language keywords and built-in variables for PostgreSQL function/procedure bodies
-  const isPostgres = props.dialect === "postgres";
-  const plpgsqlKeywords = isPostgres ? "PERFORM" : "";
-  const plpgsqlTypes = isPostgres ? " RECORD JSON JSONB" : "";
-  const plpgsqlBuiltin = isPostgres ? "SQLERRM TG_NAME TG_WHEN TG_LEVEL TG_OP TG_RELID TG_RELNAME TG_TABLE_NAME TG_TABLE_SCHEMA TG_NARGS TG_ARGV" : "";
-
-  const dialect = SQLDialect.define({
-    ...baseDialect.spec,
-    keywords: [baseDialect.spec.keywords || "", extraKeywords, plpgsqlKeywords].filter(Boolean).join(" "),
-    types: [baseDialect.spec.types || "", plpgsqlTypes].filter(Boolean).join(" ") || undefined,
-    builtin: [baseDialect.spec.builtin || "", plpgsqlBuiltin].filter(Boolean).join(" ") || undefined,
-    doubleDollarQuotedStrings: false,
-  });
+  const dialect = createDbxCodeMirrorSqlDialect(langSql, props.dialect);
 
   const initialSettings = settingsStore.editorSettings;
   const theme = await loadEditorTheme(initialSettings.theme, editorThemeAppearance(), getCurrentCustomThemeColors());
@@ -1878,7 +1864,7 @@ onMounted(async () => {
       crosshairCursor(),
       activeLineHighlighter,
       keymap.of([...defaultKeymap, ...searchKeymap, ...historyKeymap, ...foldKeymap, ...completionKeymap]),
-      sql({ dialect }),
+      langSql.sql({ dialect }),
       tooltips({ parent: document.body }),
       completionComp.of(buildSqlCompletionExtension()),
       sqlCompletionTheme(EditorView),

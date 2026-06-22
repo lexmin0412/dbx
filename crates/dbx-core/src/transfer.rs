@@ -2081,7 +2081,7 @@ pub async fn get_columns_for_transfer(
         let table = table.to_string();
         drop(connections);
         let mut client = client.lock().await;
-        return client.get_columns(&database, &schema, &table).await;
+        return client.get_columns(&database, &schema, &table, None).await;
     }
     let pool = connections.get(pool_key).ok_or("Pool not found")?;
     let schema = schema.to_string();
