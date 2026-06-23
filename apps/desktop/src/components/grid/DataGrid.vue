@@ -129,7 +129,7 @@ import { parseClipboardTable } from "@/lib/gridSelection";
 
 import { useToast } from "@/composables/useToast";
 import { useDataGridExport } from "@/composables/useDataGridExport";
-import { readTextFromClipboard } from "@/lib/clipboard";
+import { eventTargetAllowsNativeClipboard, isPlainClipboardShortcut, readTextFromClipboard } from "@/lib/clipboard";
 import ExportProgressDialog from "@/components/export/ExportProgressDialog.vue";
 import { DATA_GRID_ROW_NUM_WIDTH, useDataGridColumnResize } from "@/composables/useDataGridColumnResize";
 import { useDataGridSelection } from "@/composables/useDataGridSelection";
@@ -4379,6 +4379,9 @@ function drawCanvasGrid() {
     rowCellsUseSelectionVisual,
     cellIsSelected,
     cellCanHover: canEditCellItem,
+    infiniteScrollEnabled: infiniteScrollEnabled.value,
+    pageSize: pageSize.value,
+    currentPage: currentPage.value,
   });
 }
 
@@ -4743,25 +4746,6 @@ function openImagePreview(src: string, title: string) {
   imagePreviewOpen.value = true;
 }
 
-function selectionNodeElement(node: Node | null): Element | null {
-  if (!node) return null;
-  return node instanceof Element ? node : node.parentElement;
-}
-
-function hasNativeClipboardSelection(): boolean {
-  const selection = window.getSelection();
-  if (!selection || selection.isCollapsed) return false;
-  const anchorRegion = selectionNodeElement(selection.anchorNode)?.closest("[data-native-clipboard]");
-  const focusRegion = selectionNodeElement(selection.focusNode)?.closest("[data-native-clipboard]");
-  return !!anchorRegion && anchorRegion === focusRegion;
-}
-
-function eventTargetAllowsNativeClipboard(event: KeyboardEvent): boolean {
-  const target = event.target as HTMLElement | null;
-  if (target?.closest("input, textarea, [contenteditable='true'], [role='textbox']")) return true;
-  return clipboardShortcut(event, "c") && hasNativeClipboardSelection();
-}
-
 function onDrawerContextMenu(event: MouseEvent) {
   event.stopPropagation();
   const target = event.target as HTMLElement | null;
@@ -4770,7 +4754,7 @@ function onDrawerContextMenu(event: MouseEvent) {
 }
 
 function clipboardShortcut(event: KeyboardEvent, key: string): boolean {
-  return (event.metaKey || event.ctrlKey) && !event.altKey && event.key.toLowerCase() === key;
+  return isPlainClipboardShortcut(event, key);
 }
 
 let lastPasteEventAt = 0;
@@ -7432,13 +7416,13 @@ const gridContextMenuItems = computed<ContextMenuItem[]>(() => {
                       @dblclick.stop="toggleTranspose(item.displayIndex)"
                       @contextmenu="onRowContext(item.id, item.displayIndex)"
                     >
-                      {{ item.displayIndex + 1 }}
+                      {{ infiniteScrollEnabled ? item.displayIndex + 1 : item.displayIndex + 1 + (currentPage - 1) * pageSize }}
                     </div>
                     <div class="shrink-0" :style="{ width: `${horizontalColumnWindow.beforeWidth}px` }" />
                     <div
                       v-for="col in renderedGridColumns"
                       :key="col.actualColIdx"
-                      class="group/cell shrink-0 px-3 py-1 border-r border-border whitespace-nowrap overflow-hidden text-ellipsis relative select-none flex items-center tabular-nums text-[13px]"
+                      class="group/cell shrink-0 px-3 py-1 border-r border-border whitespace-nowrap overflow-hidden text-ellipsis relative select-none inline-block items-center tabular-nums text-[13px]"
                       :style="renderedColumnStyle(col.visibleColIdx)"
                       :class="{
                         'text-muted-foreground italic': isNull(item.data[col.actualColIdx]),
