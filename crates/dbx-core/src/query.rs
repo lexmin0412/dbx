@@ -828,7 +828,7 @@ pub async fn do_execute(
     let connections = state.connections.read().await;
     let pool = connections.get(pool_key).ok_or("Connection not found")?;
 
-    match pool {
+    let result = match pool {
         #[cfg(feature = "duckdb-bundled")]
         PoolKind::DuckDb(con) => {
             let con = con.clone();
@@ -1005,6 +1005,7 @@ pub async fn do_execute(
         PoolKind::Redis(_) => Err("Use Redis-specific commands".to_string()),
         PoolKind::MongoDb(_) => Err("Use MongoDB-specific commands".to_string()),
         PoolKind::MessageQueue => Err("Use Message Queue-specific commands".to_string()),
+        PoolKind::Nacos => Err("Use Nacos-specific commands".to_string()),
         PoolKind::InfluxDb(client) => {
             let client = client.clone();
             let database = pool_key.split(':').nth(1).unwrap_or("default").to_string();
@@ -1059,7 +1060,7 @@ pub async fn do_execute(
                 }
             }
             .await
-            .map(|result| normalize_query_result_for_js(truncate_result_with_max_rows(result, max_rows)));
+            .map(|result| truncate_result_with_max_rows(result, max_rows));
             if matches!(result.as_ref(), Err(err) if err == QUERY_CANCELED) {
                 state.remove_pool_by_key(pool_key).await;
             }
@@ -1122,9 +1123,10 @@ pub async fn do_execute(
                 }
             })
             .await
-            .map(|result| normalize_query_result_for_js(truncate_result_with_max_rows(result, max_rows)))
+            .map(|result| truncate_result_with_max_rows(result, max_rows))
         }
-    }
+    };
+    result.map(normalize_query_result_for_js)
 }
 
 fn external_driver_query_params(
@@ -1756,7 +1758,7 @@ pub async fn execute_statements_in_transaction(
             | PoolKind::Turso(_)
             | PoolKind::SqlServer(_)
             | PoolKind::Agent(_) => TxPath::Explicit,
-            PoolKind::MessageQueue => TxPath::None,
+            PoolKind::MessageQueue | PoolKind::Nacos => TxPath::None,
             #[cfg(feature = "duckdb-bundled")]
             PoolKind::DuckDb(_)
             | PoolKind::Redis(_)

@@ -6,6 +6,8 @@ import type {
   LinkedServerInfo,
   TableInfo,
   ObjectInfo,
+  CompletionAssistantRequest,
+  CompletionAssistantResponse,
   ObjectStatistics,
   ObjectSource,
   ObjectSourceKind,
@@ -517,6 +519,10 @@ export async function listTables(connectionId: string, database: string, schema:
   return invoke("list_tables", { connectionId, database, schema, filter, limit, offset, objectTypes });
 }
 
+export async function getTableComment(connectionId: string, database: string, schema: string, table: string): Promise<string | null> {
+  return invoke("get_table_comment", { connectionId, database, schema, table });
+}
+
 export async function listObjects(connectionId: string, database: string, schema: string, objectTypes?: SidebarObjectKind[]): Promise<ObjectInfo[]> {
   return invoke("list_objects", { connectionId, database, schema, objectTypes });
 }
@@ -527,6 +533,10 @@ export async function listObjectStatistics(connectionId: string, database: strin
 
 export async function listCompletionObjects(connectionId: string, database: string, schema: string): Promise<ObjectInfo[]> {
   return invoke("list_completion_objects", { connectionId, database, schema });
+}
+
+export async function completionAssistantSearch(request: CompletionAssistantRequest): Promise<CompletionAssistantResponse> {
+  return invoke("completion_assistant_search", { request });
 }
 
 export async function getObjectSource(connectionId: string, database: string, schema: string, name: string, objectType: ObjectSourceKind): Promise<ObjectSource> {
@@ -1040,6 +1050,10 @@ export async function revealPathInFileManager(path: string): Promise<void> {
   return invoke("reveal_path_in_file_manager", { path });
 }
 
+export async function isSqliteDatabaseFile(path: string): Promise<boolean> {
+  return invoke("is_sqlite_database_file", { path });
+}
+
 export async function backupSqliteDatabase(connectionId: string, destinationPath: string): Promise<void> {
   return invoke("backup_sqlite_database", { connectionId, destinationPath });
 }
@@ -1105,10 +1119,10 @@ export async function getAppVersion(): Promise<string> {
 export interface RedisKeyInfo {
   key_display: string;
   key_raw: string;
-  key_type: string;
-  ttl: number;
-  size: number;
-  value_preview: string;
+  key_type?: string;
+  ttl?: number;
+  size?: number;
+  value_preview?: string;
 }
 
 export interface RedisDatabaseInfo {
@@ -1829,3 +1843,4 @@ export async function exportQueryResultMarkdown(filePath: string, columns: strin
 }
 
 export * from "./mq-tauri";
+export * from "./nacos-tauri";

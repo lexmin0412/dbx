@@ -87,7 +87,7 @@ import type { BuildSingleColumnAlterSqlOptions } from "@/lib/tableStructureEdito
 import { buildTableSelectSql, quoteTableIdentifier } from "@/lib/tableSelectSql";
 import { uuid } from "@/lib/utils";
 import { resolveHeaderColumnType } from "@/lib/dataGridColumnType";
-import { canEditExistingTableRows, hiveTablePropertiesIndicateTransactional, isHiddenGridColumn, isTdengineExistingRowReadonlyColumn, usesSyntheticRowIdKey } from "@/lib/tableEditing";
+import { canEditExistingTableRows, canUseKeylessRowPredicate, hiveTablePropertiesIndicateTransactional, isHiddenGridColumn, isTdengineExistingRowReadonlyColumn, usesSyntheticRowIdKey } from "@/lib/tableEditing";
 import { buildDataGridContextFilterCondition, buildDataGridCountSql, buildHiveTablePropertiesSql, type DataGridContextFilterMode } from "@/lib/dataGridSql";
 import {
   buildVisibleTransposeRows,
@@ -141,6 +141,7 @@ import { useSettingsStore } from "@/stores/settingsStore";
 import type { DataGridSortDirection } from "@/lib/dataGridSort";
 import { getTableMetadataCapabilities } from "@/lib/tableMetadataCapabilities";
 import { forgetDataGridConditionHistory, loadDataGridConditionHistory, rememberDataGridConditionHistory } from "@/lib/dataGridConditionHistory";
+import { caretPositionInsideInsertedSqlSingleQuotes, insertedSqlSingleQuoteAtCaret } from "@/lib/sqlQuoteCaret";
 
 const SqlPreviewPanel = defineAsyncComponent(() => import("@/components/editor/SqlPreviewPanel.vue"));
 
@@ -453,6 +454,7 @@ const orderBySuggestionPosition = ref({ left: 0, top: 0 });
 const orderByInput = ref(props.initialOrderByInput ?? "");
 const hasOrderByInput = computed(() => orderByInput.value.trim().length > 0);
 const whereFilterInput = ref(props.initialWhereInput ?? "");
+let previousWhereFilterInputValue = whereFilterInput.value;
 const hasWhereFilterInput = computed(() => whereFilterInput.value.trim().length > 0);
 const conditionHistoryScope = computed(() => ({
   connectionId: props.connectionId,
@@ -1327,9 +1329,38 @@ function deleteWhereHistorySuggestion(value: string) {
   whereSuggestionIndex.value = whereSuggestions.value.length ? Math.min(whereSuggestionIndex.value, whereSuggestions.value.length - 1) : -1;
 }
 
+function onWhereFilterInput(event: Event) {
+  const input = event.target instanceof HTMLInputElement ? event.target : null;
+  if (!input) return;
+  const nextValue = input.value;
+  if (
+    insertedSqlSingleQuoteAtCaret({
+      previousValue: previousWhereFilterInputValue,
+      nextValue,
+      selectionStart: input.selectionStart,
+    })
+  ) {
+    const caret = input.selectionStart ?? nextValue.length;
+    const pairedValue = `${nextValue.slice(0, caret)}'${nextValue.slice(caret)}`;
+    whereFilterInput.value = pairedValue;
+    previousWhereFilterInputValue = pairedValue;
+    nextTick(() => input.setSelectionRange(caret, caret));
+    return;
+  }
+  const nextCaret = caretPositionInsideInsertedSqlSingleQuotes({
+    previousValue: previousWhereFilterInputValue,
+    nextValue,
+    selectionStart: input.selectionStart,
+  });
+  previousWhereFilterInputValue = nextValue;
+  if (nextCaret == null) return;
+  nextTick(() => input.setSelectionRange(nextCaret, nextCaret));
+}
+
 watch(whereFilterInput, (val) => {
   emit("update:whereInput", currentWhereInput() ?? "");
   persistStructuredFilterState();
+  previousWhereFilterInputValue = val;
   whereSuggestions.value = [];
   if (!props.tableMeta?.columns?.length) return;
   const trimmed = val.trim();
@@ -2345,6 +2376,7 @@ const canJumpLastPage = computed(() => canGoNextPage.value && (hasKnownTotalRowC
 const totalRowCountBusy = computed(() => props.totalRowCountLoading === true || manualTotalRowCountLoading.value);
 const canCalculateTotalRowCount = computed(() => !isResultsContext.value && !!props.connectionId && (!!props.tableMeta || !!props.countSql));
 const showQueryEditReadyBadge = computed(() => isResultsContext.value && hasData.value && !!props.editable && !!props.tableMeta);
+const showKeylessEditWarning = computed(() => !!props.editable && !!props.tableMeta && canUseKeylessRowPredicate(props.databaseType, props.tableMeta.primaryKeys ?? []));
 const canShowWhereSearch = computed(() => !!props.onExecuteSql && !isResultsContext.value);
 const canUseWhereSearch = computed(() => !!props.tableMeta && !!props.onExecuteSql && !isResultsContext.value);
 type DataGridTableMeta = NonNullable<typeof props.tableMeta>;
@@ -2630,6 +2662,7 @@ const {
   dirtyRows,
   newRows,
   deletedRows,
+  pendingChangesVersion,
   pendingChangeCount,
   hasPendingChanges,
   transactionActive,
@@ -2711,7 +2744,7 @@ function closeSqlPreview() {
 }
 
 // Watch for edits — auto-refresh preview when panel is open
-watch([pendingChangeCount, dirtyRows, newRows, deletedRows], () => {
+watch([pendingChangeCount, pendingChangesVersion], () => {
   schedulePreviewRefresh();
 });
 
@@ -6601,6 +6634,7 @@ const gridContextMenuItems = computed<ContextMenuItem[]>(() => {
                     spellcheck="false"
                     class="flex-1 h-5 min-w-0 text-xs bg-transparent outline-none placeholder:text-muted-foreground/60"
                     placeholder=""
+                    @input="onWhereFilterInput"
                     @keydown="onWhereFilterKeydown"
                     @focus="showWhereHistorySuggestions"
                     @click="updateWhereSuggestionPosition"
@@ -6718,6 +6752,17 @@ const gridContextMenuItems = computed<ContextMenuItem[]>(() => {
                 </TooltipTrigger>
                 <TooltipContent side="bottom" class="max-w-sm">
                   {{ t("grid.queryEditReadyHint", { table: tableMeta?.tableName }) }}
+                </TooltipContent>
+              </Tooltip>
+              <Tooltip v-if="showKeylessEditWarning">
+                <TooltipTrigger as-child>
+                  <div class="flex h-5 items-center gap-1 rounded border border-amber-500/30 bg-amber-500/10 px-1.5 text-xs font-medium text-amber-700 dark:text-amber-300">
+                    <KeyRound class="h-3 w-3" />
+                    {{ t("grid.keylessEditWarning") }}
+                  </div>
+                </TooltipTrigger>
+                <TooltipContent side="bottom" class="max-w-sm">
+                  {{ t("grid.keylessEditWarningHint") }}
                 </TooltipContent>
               </Tooltip>
               <Button v-if="props.context !== 'results'" variant="ghost" size="sm" class="h-5 text-xs px-1.5 shrink-0" :disabled="isSaving" @click="onToolbarRefresh">

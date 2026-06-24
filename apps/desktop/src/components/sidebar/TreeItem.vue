@@ -71,7 +71,7 @@ import { buildTableDeleteTemplate, buildTableInsertTemplate, buildTableSelectTem
 import { connectionFilePath, defaultSqliteBackupFileName, isMemorySqlitePath, sqliteBackupSourcePath } from "@/lib/connectionFile";
 import { revealPathInFileManager } from "@/lib/tauri";
 import { clearActiveTableReferencePayload, createTableReferencePayload, createTableReferenceDropEvent, setActiveTableReferencePayload, type QueryEditorTableReferencePayload } from "@/lib/queryEditorTableDrop";
-import { editablePrimaryKeys, usesSyntheticRowIdKey } from "@/lib/tableEditing";
+import { editableRowIdentifierColumns, usesSyntheticRowIdKey } from "@/lib/tableEditing";
 import { supportsDatabaseCreation, supportsDatabaseSearch, supportsFieldLineage, supportsObjectBrowserTreeNode, supportsSchemaDiagram, supportsSqlFileExecution, supportsTableImport, supportsTableTruncate, supportsTableStructureEditing, usesTreeSchemaMode } from "@/lib/databaseCapabilities";
 import { copyNameForTreeNode, objectSourceKindForTreeNode, sidebarSelectionCopyAction, treeNodeRowAction, treeNodeRowDoubleClickAction } from "@/lib/treeNodeClick";
 import { formatSqlInsert } from "@/lib/exportFormats";
@@ -122,8 +122,10 @@ import { Dialog, DialogContent, DialogHeader, DialogTitle, DialogFooter } from "
 import { Button } from "@/components/ui/button";
 import { Badge } from "@/components/ui/badge";
 import { Input } from "@/components/ui/input";
+import { SearchableSelect } from "@/components/ui/searchable-select";
 import LightTooltip from "@/components/ui/LightTooltip.vue";
 import { flattenTree } from "@/composables/useFlatTree";
+import { createDatabaseCollationOptionsForCharset, fallbackCreateDatabaseCharsetMetadata, nextCreateDatabaseCollation, normalizeCreateDatabaseCharset, parseCreateDatabaseCharsetMetadata } from "@/lib/createDatabaseCharsetOptions";
 
 const { t } = useI18n();
 const labelRef = ref<HTMLElement>();
@@ -244,6 +246,8 @@ function getIconInfo(node: TreeNode): { icon: any; colorClass: string } | null {
       return { icon: Database, colorClass: "text-red-400" };
     case "mq-tenant":
       return { icon: FolderOpen, colorClass: "text-sky-400" };
+    case "nacos-namespace":
+      return { icon: FolderOpen, colorClass: "text-sky-500" };
     case "etcd-root":
       return { icon: Database, colorClass: "text-sky-500" };
     case "mongo-db":
@@ -421,7 +425,10 @@ function isTooltipDisabled(): boolean {
 
 async function toggle() {
   const node = props.node;
-  if (node.isLoading) return;
+  if (node.isLoading) {
+    if (node.type !== "connection") return;
+    node.isLoading = false;
+  }
   emit("search-toggle", node);
   const wasExpanded = !!node.isExpanded;
 
@@ -466,6 +473,8 @@ async function toggle() {
         await connectionStore.loadVectorCollections(node.connectionId);
       } else if (config?.db_type === "mq") {
         await connectionStore.loadMqTenants(node.connectionId);
+      } else if (config?.db_type === "nacos") {
+        await connectionStore.loadNacosNamespaces(node.connectionId);
       } else {
         await connectionStore.loadDatabases(node.connectionId);
       }
@@ -474,6 +483,8 @@ async function toggle() {
       queryStore.createTab(node.connectionId, node.database, tabTitle, "redis");
     } else if (node.type === "mq-tenant" && node.connectionId) {
       queryStore.openMqAdmin(node.connectionId, { tenant: node.mqTenant || node.label });
+    } else if (node.type === "nacos-namespace" && node.connectionId) {
+      queryStore.openNacosAdmin(node.connectionId, { namespace: node.nacosNamespace || "", namespaceName: node.nacosNamespaceName || node.label });
     } else if (node.type === "etcd-root" && node.connectionId) {
       const tabTitle = `${connectionStore.getConfig(node.connectionId)?.name || "etcd"}:keys`;
       queryStore.createTab(node.connectionId, "", tabTitle, "etcd");
@@ -774,6 +785,8 @@ function onDoubleClick() {
     openData();
   } else if (action === "open-source") {
     void viewObjectSource();
+  } else if (action === "open-saved-sql") {
+    openSavedSqlFile();
   } else if (action === "toggle" && props.node.type === "mongo-collection") {
     openMongoCollectionData(props.node);
   } else if (action === "toggle") {
@@ -786,6 +799,16 @@ function openMongoCollectionData(node: TreeNode) {
   const tabTitle = `${node.database}.${node.label}`;
   const tab = queryStore.createTab(node.connectionId, node.database, tabTitle, "mongo");
   queryStore.updateSql(tab, node.label);
+}
+
+function openSavedSqlFile() {
+  const node = props.node;
+  if (node.type !== "saved-sql-file" || !node.savedSqlId) return;
+  const file = savedSqlStore.getFile(node.savedSqlId);
+  if (!file) return;
+  queryStore.openSavedSql(file);
+  connectionStore.activeConnectionId = file.connectionId;
+  void savedSqlStore.recordFileUsage(file.id);
 }
 
 async function openObjectBrowser() {
@@ -936,6 +959,7 @@ async function openData() {
       });
       try {
         const nextColumns = await api.getColumns(node.connectionId, node.database, querySchema, node.label);
+        const indexes = await api.listIndexes(node.connectionId, node.database, querySchema, node.label).catch(() => []);
         if (!isCurrentDataTab()) {
           console.info("[DBX][openData:metadata:stale]", {
             traceId,
@@ -945,7 +969,7 @@ async function openData() {
           });
           return;
         }
-        const nextPrimaryKeys = editablePrimaryKeys(effectiveDbType, nextColumns, tableType);
+        const nextPrimaryKeys = editableRowIdentifierColumns(effectiveDbType, nextColumns, indexes, tableType);
         queryStore.setTableMeta(tabId, {
           schema: tableSchema,
           tableName: node.label,
@@ -1356,6 +1380,19 @@ const showCreateDatabaseDialog = ref(false);
 const createDatabaseName = ref("");
 const createDatabaseCharset = ref("utf8mb4");
 const createDatabaseCollation = ref("utf8mb4_unicode_ci");
+const showCreateNacosNamespaceDialog = ref(false);
+const createNacosNamespaceId = ref("");
+const createNacosNamespaceName = ref("");
+const createNacosNamespaceDesc = ref("");
+const createNacosNamespaceLoading = ref(false);
+const showEditNacosNamespaceDialog = ref(false);
+const editNacosNamespaceName = ref("");
+const editNacosNamespaceDesc = ref("");
+const editNacosNamespaceLoading = ref(false);
+const fallbackCreateDatabaseCharset = fallbackCreateDatabaseCharsetMetadata();
+const createDatabaseCharsetOptions = ref<string[]>(fallbackCreateDatabaseCharset.charsets);
+const createDatabaseCollationsByCharset = ref<Record<string, string[]>>(fallbackCreateDatabaseCharset.collationsByCharset);
+const createDatabaseCharsetLoading = ref(false);
 const showDropDatabaseConfirm = ref(false);
 const dropDatabaseLoading = ref(false);
 const showDropMongoCollectionConfirm = ref(false);
@@ -1832,6 +1869,17 @@ const canCreateDatabase = computed(() => {
   return props.node.type === "connection" && (supportsDatabaseCreation(config?.db_type) || config?.db_type === "duckdb" || (config?.db_type === "mongodb" && config.driver_profile !== "mongodb-legacy"));
 });
 
+const canCreateNacosNamespace = computed(() => {
+  const config = props.node.connectionId ? connectionStore.getConfig(props.node.connectionId) : undefined;
+  return props.node.type === "connection" && config?.db_type === "nacos" && !config.read_only;
+});
+
+const canEditNacosNamespace = computed(() => {
+  if (props.node.type !== "nacos-namespace" || !props.node.connectionId || !props.node.nacosNamespace) return false;
+  const config = connectionStore.getConfig(props.node.connectionId);
+  return config?.db_type === "nacos" && !config.read_only;
+});
+
 const isDuckDbConnection = computed(() => {
   const config = props.node.connectionId ? connectionStore.getConfig(props.node.connectionId) : undefined;
   return props.node.type === "connection" && config?.db_type === "duckdb";
@@ -1982,7 +2030,97 @@ function openCreateDatabaseDialog() {
   createDatabaseName.value = "";
   createDatabaseCharset.value = "utf8mb4";
   createDatabaseCollation.value = "utf8mb4_unicode_ci";
+  createDatabaseCharsetOptions.value = fallbackCreateDatabaseCharset.charsets;
+  createDatabaseCollationsByCharset.value = fallbackCreateDatabaseCharset.collationsByCharset;
   showCreateDatabaseDialog.value = true;
+  void loadCreateDatabaseCharsetMetadata();
+}
+
+function updateCreateDatabaseCharset(value: string) {
+  const previousCharset = createDatabaseCharset.value;
+  createDatabaseCharset.value = value;
+  createDatabaseCollation.value = nextCreateDatabaseCollation(value, previousCharset, createDatabaseCollation.value, createDatabaseCollationsByCharset.value);
+}
+
+async function loadCreateDatabaseCharsetMetadata() {
+  const node = props.node;
+  if (!node.connectionId || createDatabaseCharsetLoading.value) return;
+  createDatabaseCharsetLoading.value = true;
+  try {
+    await connectionStore.ensureConnected(node.connectionId);
+    const [charsetResult, collationResult] = await Promise.all([api.executeQuery(node.connectionId, "", "SHOW CHARACTER SET", undefined, undefined, { maxRows: 1000 }), api.executeQuery(node.connectionId, "", "SHOW COLLATION", undefined, undefined, { maxRows: 10000 })]);
+    if (!showCreateDatabaseDialog.value) return;
+    const metadata = parseCreateDatabaseCharsetMetadata(charsetResult, collationResult);
+    createDatabaseCharsetOptions.value = metadata.charsets;
+    createDatabaseCollationsByCharset.value = metadata.collationsByCharset;
+    if (!createDatabaseCharsetOptions.value.includes(createDatabaseCharset.value) && createDatabaseCharsetOptions.value.length) {
+      updateCreateDatabaseCharset(createDatabaseCharsetOptions.value[0]);
+    } else {
+      createDatabaseCollation.value = nextCreateDatabaseCollation(createDatabaseCharset.value, createDatabaseCharset.value, createDatabaseCollation.value, createDatabaseCollationsByCharset.value);
+    }
+  } catch {
+    createDatabaseCharsetOptions.value = fallbackCreateDatabaseCharset.charsets;
+    createDatabaseCollationsByCharset.value = fallbackCreateDatabaseCharset.collationsByCharset;
+  } finally {
+    createDatabaseCharsetLoading.value = false;
+  }
+}
+
+function openCreateNacosNamespaceDialog() {
+  createNacosNamespaceId.value = "";
+  createNacosNamespaceName.value = "";
+  createNacosNamespaceDesc.value = "";
+  showCreateNacosNamespaceDialog.value = true;
+}
+
+async function confirmCreateNacosNamespace() {
+  const node = props.node;
+  const namespaceName = createNacosNamespaceName.value.trim();
+  if (!node.connectionId || !namespaceName || createNacosNamespaceLoading.value) return;
+  createNacosNamespaceLoading.value = true;
+  try {
+    await api.nacosCreateNamespace(node.connectionId, {
+      namespaceId: createNacosNamespaceId.value.trim() || undefined,
+      namespaceName,
+      namespaceDesc: createNacosNamespaceDesc.value.trim() || namespaceName,
+    });
+    showCreateNacosNamespaceDialog.value = false;
+    await connectionStore.loadNacosNamespaces(node.connectionId, { force: true });
+    node.isExpanded = true;
+    toast(t("nacos.namespaceCreated", { name: namespaceName }), 3000);
+  } catch (e: any) {
+    toast(t("contextMenu.tableOperationFailed", { message: translateBackendError(t, e?.message || String(e)) }), 5000);
+  } finally {
+    createNacosNamespaceLoading.value = false;
+  }
+}
+
+function openEditNacosNamespaceDialog() {
+  editNacosNamespaceName.value = props.node.nacosNamespaceName || props.node.label;
+  editNacosNamespaceDesc.value = props.node.comment || "";
+  showEditNacosNamespaceDialog.value = true;
+}
+
+async function confirmEditNacosNamespace() {
+  const node = props.node;
+  const namespaceId = node.nacosNamespace?.trim() || "";
+  const namespaceName = editNacosNamespaceName.value.trim();
+  if (!node.connectionId || !namespaceId || !namespaceName || editNacosNamespaceLoading.value) return;
+  editNacosNamespaceLoading.value = true;
+  try {
+    await api.nacosUpdateNamespace(node.connectionId, {
+      namespaceId,
+      namespaceName,
+      namespaceDesc: editNacosNamespaceDesc.value.trim() || namespaceName,
+    });
+    showEditNacosNamespaceDialog.value = false;
+    await connectionStore.loadNacosNamespaces(node.connectionId, { force: true });
+    toast(t("nacos.namespaceUpdated", { name: namespaceName }), 3000);
+  } catch (e: any) {
+    toast(t("contextMenu.tableOperationFailed", { message: translateBackendError(t, e?.message || String(e)) }), 5000);
+  } finally {
+    editNacosNamespaceLoading.value = false;
+  }
 }
 
 function ensureDuckDbFileExtension(path: string): string {
@@ -2809,7 +2947,7 @@ const nodeIconClass = computed(() => {
 const canConfigureVisibleDatabases = computed(() => {
   if (props.node.type !== "connection" || !props.node.connectionId) return false;
   const dbType = connectionStore.getConfig(props.node.connectionId)?.db_type;
-  return dbType !== "elasticsearch" && dbType !== "qdrant" && dbType !== "milvus" && dbType !== "etcd" && dbType !== "mq";
+  return dbType !== "elasticsearch" && dbType !== "qdrant" && dbType !== "milvus" && dbType !== "etcd" && dbType !== "mq" && dbType !== "nacos";
 });
 const canCopyFinalProxyPort = computed(() => {
   if (props.node.type !== "connection" || !props.node.connectionId) return false;
@@ -3221,6 +3359,13 @@ function treeItemMenuItems(): ContextMenuItem[] {
         icon: Plus,
       });
     }
+    if (canCreateNacosNamespace.value) {
+      items.push({
+        label: t("nacos.createNamespace"),
+        action: openCreateNacosNamespaceDialog,
+        icon: FolderPlus,
+      });
+    }
     items.push({ label: "", separator: true });
     if (availableGroups.value.length > 0 || currentGroupId.value) {
       const groupChildren: ContextMenuItem[] = availableGroups.value.map((group: { id: string; name: string }) => ({
@@ -3400,6 +3545,22 @@ function treeItemMenuItems(): ContextMenuItem[] {
       items.push({ label: "", separator: true });
       items.push({ label: t("contextMenu.dropDatabase"), action: dropDatabase, icon: Trash2, shortcut: shortcutDelete, variant: "destructive" as const });
     }
+    return items;
+  }
+
+  if (node.type === "nacos-namespace") {
+    items.push({ label: t("contextMenu.openConnection"), action: toggle, icon: FolderOpen });
+    if (canEditNacosNamespace.value) {
+      items.push({ label: t("nacos.editNamespace"), action: openEditNacosNamespaceDialog, icon: Pencil });
+    }
+    items.push({
+      label: t("contextMenu.refreshChildren"),
+      action: refresh,
+      icon: RefreshCw,
+      shortcut: shortcutRefresh,
+    });
+    items.push({ label: "", separator: true });
+    items.push({ label: t("contextMenu.copyName"), action: copyName, icon: Copy, shortcut: shortcutCopyName.value });
     return items;
   }
 
@@ -3903,16 +4064,103 @@ function treeItemMenuItems(): ContextMenuItem[] {
       <div v-if="canSetCreateDatabaseCharset" class="grid gap-2">
         <div class="grid gap-1.5">
           <label class="text-xs font-medium text-muted-foreground">{{ t("contextMenu.createDatabaseCharset") }}</label>
-          <Input v-model="createDatabaseCharset" :placeholder="t('contextMenu.createDatabaseCharsetPlaceholder')" @keydown.enter.prevent="confirmCreateDatabase" />
+          <SearchableSelect
+            :model-value="createDatabaseCharset"
+            :options="createDatabaseCharsetOptions"
+            :placeholder="t('contextMenu.createDatabaseCharsetPlaceholder')"
+            :search-placeholder="t('contextMenu.createDatabaseCharsetSearchPlaceholder')"
+            :empty-text="t('contextMenu.createDatabaseCharsetEmpty')"
+            :loading-text="t('contextMenu.createDatabaseCharsetLoading')"
+            :loading="createDatabaseCharsetLoading"
+            :normalize-custom="normalizeCreateDatabaseCharset"
+            allow-custom
+            trigger-variant="outline"
+            trigger-class="h-9 w-full max-w-none justify-between border bg-background px-3 text-sm shadow-xs hover:bg-accent"
+            content-class="w-[var(--reka-popover-trigger-width)]"
+            @update:model-value="updateCreateDatabaseCharset"
+          >
+            <template #custom-option-label="{ value }">
+              <span class="truncate">{{ t("contextMenu.createDatabaseCharsetCustomOption", { value }) }}</span>
+            </template>
+          </SearchableSelect>
         </div>
         <div class="grid gap-1.5">
           <label class="text-xs font-medium text-muted-foreground">{{ t("contextMenu.createDatabaseCollation") }}</label>
-          <Input v-model="createDatabaseCollation" :placeholder="t('contextMenu.createDatabaseCollationPlaceholder')" @keydown.enter.prevent="confirmCreateDatabase" />
+          <SearchableSelect
+            v-model="createDatabaseCollation"
+            :options="createDatabaseCollationOptionsForCharset(createDatabaseCharset, createDatabaseCollationsByCharset)"
+            :placeholder="t('contextMenu.createDatabaseCollationPlaceholder')"
+            :search-placeholder="t('contextMenu.createDatabaseCollationSearchPlaceholder')"
+            :empty-text="t('contextMenu.createDatabaseCollationEmpty')"
+            :loading-text="t('contextMenu.createDatabaseCollationLoading')"
+            :loading="createDatabaseCharsetLoading"
+            :normalize-custom="normalizeCreateDatabaseCharset"
+            allow-custom
+            trigger-variant="outline"
+            trigger-class="h-9 w-full max-w-none justify-between border bg-background px-3 text-sm shadow-xs hover:bg-accent"
+            content-class="w-[var(--reka-popover-trigger-width)]"
+          >
+            <template #custom-option-label="{ value }">
+              <span class="truncate">{{ t("contextMenu.createDatabaseCollationCustomOption", { value }) }}</span>
+            </template>
+          </SearchableSelect>
         </div>
       </div>
       <DialogFooter>
         <Button variant="outline" @click="showCreateDatabaseDialog = false">{{ t("dangerDialog.cancel") }}</Button>
         <Button :disabled="!createDatabaseName.trim()" @click="confirmCreateDatabase">{{ t("dangerDialog.confirm") }}</Button>
+      </DialogFooter>
+    </DialogContent>
+  </Dialog>
+
+  <Dialog v-model:open="showCreateNacosNamespaceDialog">
+    <DialogContent class="sm:max-w-[420px]">
+      <DialogHeader>
+        <DialogTitle>{{ t("nacos.createNamespace") }}</DialogTitle>
+      </DialogHeader>
+      <div class="grid gap-3">
+        <div class="grid gap-1.5">
+          <label class="text-xs font-medium text-muted-foreground">{{ t("nacos.namespaceId") }}</label>
+          <Input v-model="createNacosNamespaceId" :placeholder="t('nacos.namespaceIdPlaceholder')" @keydown.enter.prevent="confirmCreateNacosNamespace" />
+        </div>
+        <div class="grid gap-1.5">
+          <label class="text-xs font-medium text-muted-foreground">{{ t("nacos.namespaceName") }}</label>
+          <Input v-model="createNacosNamespaceName" :placeholder="t('nacos.namespaceNamePlaceholder')" @keydown.enter.prevent="confirmCreateNacosNamespace" />
+        </div>
+        <div class="grid gap-1.5">
+          <label class="text-xs font-medium text-muted-foreground">{{ t("nacos.namespaceDesc") }}</label>
+          <Input v-model="createNacosNamespaceDesc" :placeholder="t('nacos.namespaceDescPlaceholder')" @keydown.enter.prevent="confirmCreateNacosNamespace" />
+        </div>
+      </div>
+      <DialogFooter>
+        <Button variant="outline" :disabled="createNacosNamespaceLoading" @click="showCreateNacosNamespaceDialog = false">{{ t("dangerDialog.cancel") }}</Button>
+        <Button :disabled="!createNacosNamespaceName.trim() || createNacosNamespaceLoading" @click="confirmCreateNacosNamespace">
+          {{ createNacosNamespaceLoading ? t("nacos.creatingNamespace") : t("dangerDialog.confirm") }}
+        </Button>
+      </DialogFooter>
+    </DialogContent>
+  </Dialog>
+
+  <Dialog v-model:open="showEditNacosNamespaceDialog">
+    <DialogContent class="sm:max-w-[420px]">
+      <DialogHeader>
+        <DialogTitle>{{ t("nacos.editNamespace") }}</DialogTitle>
+      </DialogHeader>
+      <div class="grid gap-3">
+        <div class="grid gap-1.5">
+          <label class="text-xs font-medium text-muted-foreground">{{ t("nacos.namespaceName") }}</label>
+          <Input v-model="editNacosNamespaceName" :placeholder="t('nacos.namespaceNamePlaceholder')" @keydown.enter.prevent="confirmEditNacosNamespace" />
+        </div>
+        <div class="grid gap-1.5">
+          <label class="text-xs font-medium text-muted-foreground">{{ t("nacos.namespaceDesc") }}</label>
+          <Input v-model="editNacosNamespaceDesc" :placeholder="t('nacos.namespaceDescPlaceholder')" @keydown.enter.prevent="confirmEditNacosNamespace" />
+        </div>
+      </div>
+      <DialogFooter>
+        <Button variant="outline" :disabled="editNacosNamespaceLoading" @click="showEditNacosNamespaceDialog = false">{{ t("dangerDialog.cancel") }}</Button>
+        <Button :disabled="!editNacosNamespaceName.trim() || editNacosNamespaceLoading" @click="confirmEditNacosNamespace">
+          {{ editNacosNamespaceLoading ? t("nacos.updatingNamespace") : t("dangerDialog.confirm") }}
+        </Button>
       </DialogFooter>
     </DialogContent>
   </Dialog>

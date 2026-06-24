@@ -1,6 +1,6 @@
 <script setup lang="ts">
 import { ref, onMounted, onBeforeUnmount, onActivated, onDeactivated, watch, shallowRef, computed, nextTick } from "vue";
-import { Play, Copy, Table2, TextSelect } from "@lucide/vue";
+import { FileCode, Play, Copy, Table2, TextSelect } from "@lucide/vue";
 import { useI18n } from "vue-i18n";
 import type { CompletionContext } from "@codemirror/autocomplete";
 import type { EditorView as EditorViewType } from "@codemirror/view";
@@ -46,7 +46,7 @@ import * as api from "@/lib/api";
 import { areSqlSemanticDiagnosticsEqual, buildSqlParserErrorDiagnostic, buildSqlSemanticDiagnostics, shouldRunSqlSemanticDiagnostics, type SqlSemanticDiagnostic } from "@/lib/sqlSemanticDiagnostics";
 import { buildRedisSyntaxDiagnostics, shouldRunRedisDiagnostics } from "@/lib/redisSyntaxDiagnostics";
 import { buildRedisCompletionItemsFromContext, getRedisCompletionContext, getRedisCompletionResultValidFor, shouldAutoOpenRedisCompletion, takesKeyArgument, type RedisCompletionItem } from "@/lib/redisCompletion";
-import type { SqlCompletionColumn, SqlCompletionForeignKey, SqlCompletionItem, SqlCompletionObject } from "@/lib/sqlCompletion";
+import type { SqlCompletionColumn, SqlCompletionForeignKey, SqlCompletionItem, SqlCompletionObject, SqlCompletionTable } from "@/lib/sqlCompletion";
 import type { DatabaseType, SqlReferenceAnalysis, SqlTableReference, SqlTextSpan } from "@/types/database";
 
 const props = defineProps<{
@@ -65,6 +65,8 @@ const props = defineProps<{
   initialSelection?: { anchor: number; head: number };
 }>();
 
+const COMPLETION_REMOTE_LATENCY_BUDGET_MS = 120;
+
 const emit = defineEmits<{
   "update:modelValue": [value: string];
   selectionChange: [value: string];
@@ -74,6 +76,7 @@ const emit = defineEmits<{
   save: [];
   clickTable: [tableName: string];
   viewTableData: [tableName: string];
+  viewTableDdl: [tableName: string];
   clickColumn: [columns: Array<{ name: string; table: string; schema?: string }>, error?: string | undefined];
   closeColumnPanel: [];
   viewportChange: [viewport: { scrollTop: number; scrollLeft: number }];
@@ -223,6 +226,20 @@ const zoomCommitScheduler = createEditorZoomCommitScheduler((fontSize) => {
   settingsStore.updateEditorSettings({ fontSize });
 });
 
+const queryEditorAppearanceSettings = computed(() => {
+  const settings = settingsStore.editorSettings;
+  return {
+    fontFamily: settings.fontFamily,
+    fontSize: settings.fontSize,
+    theme: settings.theme,
+    customThemeColors: settings.customThemeColors,
+    customThemes: settings.customThemes,
+    activeCustomThemeId: settings.activeCustomThemeId,
+    wordWrap: settings.wordWrap,
+    shortcuts: settings.shortcuts,
+  };
+});
+
 function syncEditorFontCssVars(fontSize = liveFontSize.value, fontFamily = settingsStore.editorSettings.fontFamily) {
   if (!editorRef.value) return;
   editorRef.value.style.setProperty(EDITOR_FONT_SIZE_CSS_VAR, `${clampEditorFontSize(fontSize)}px`);
@@ -333,6 +350,18 @@ function requestExecute() {
   pickerAnchor.value = executionPickerAnchor(currentView, cursorPos, candidates.length);
   pickerVisible.value = true;
   setPreviewRange({ from: candidates[0].from, to: candidates[0].to });
+  return true;
+}
+
+function handleSqlSingleQuote(view: EditorViewType): boolean {
+  const { state } = view;
+  if (state.readOnly) return false;
+  if (state.selection.ranges.some((range) => !range.empty || range.from === 0 || state.doc.sliceString(range.from - 1, range.from) !== "'")) return false;
+  const transaction = state.changeByRange((range) => ({
+    changes: { from: range.from, insert: "'" },
+    range,
+  }));
+  view.dispatch(transaction, { userEvent: "input.type" });
   return true;
 }
 
@@ -455,6 +484,12 @@ function openTableFromContextMenu() {
   focusEditor();
 }
 
+function openTableDdlFromContextMenu() {
+  if (!contextTableName.value) return;
+  emit("viewTableDdl", contextTableName.value);
+  focusEditor();
+}
+
 function selectSqlLineFromGutter(currentView: EditorViewType, line: { from: number; to: number }, event: Event): boolean {
   if (!(event instanceof MouseEvent) || event.button !== 0) return false;
   event.preventDefault();
@@ -479,6 +514,12 @@ const contextMenuItems = computed<ContextMenuItem[]>(() => [
     action: openTableFromContextMenu,
     disabled: !contextTableName.value,
     icon: Table2,
+  },
+  {
+    label: t("contextMenu.viewDdl"),
+    action: openTableDdlFromContextMenu,
+    disabled: !contextTableName.value,
+    icon: FileCode,
   },
   { label: "", separator: true },
   {
@@ -1464,6 +1505,20 @@ function mergeCompletionTables(existing: Array<{ name: string; schema?: string; 
   return merged;
 }
 
+function withCompletionLatencyBudget<T>(remote: Promise<T>, local: T): Promise<T> {
+  return Promise.race([remote, new Promise<T>((resolve) => setTimeout(() => resolve(local), COMPLETION_REMOTE_LATENCY_BUDGET_MS))]);
+}
+
+function listCompletionTablesWithLatencyBudget(connectionId: string, database: string, filter: string, limit: number, schema?: string): Promise<SqlCompletionTable[]> {
+  const local = connectionStore.lookupLocalCompletionTables(connectionId, database, filter, limit, schema);
+  const remote = connectionStore.listCompletionTables(connectionId, database, filter, limit, schema).then((tables) => {
+    cachedTables = mergeCompletionTables(cachedTables, tables);
+    return tables;
+  });
+  if (local.length === 0) return remote;
+  return withCompletionLatencyBudget(remote, local);
+}
+
 async function performAsyncCompletionWithResult(epoch: number, completionContext: ReturnType<typeof getSqlCompletionContext>, fullDoc: string, position: number) {
   const localOnlyMetadata = usesLocalOnlyCompletionMetadata();
   const onDemandOnlyColumns = usesOnDemandOnlyCompletionColumns();
@@ -1500,7 +1555,7 @@ async function performAsyncCompletionWithResult(epoch: number, completionContext
   let tables = shouldLoadTables
     ? localOnlyMetadata
       ? connectionStore.lookupLocalCompletionTables(props.connectionId!, tableLookupDatabase, tableLookupFilter, MAX_COMPLETION_TABLES, tableLookupSchema)
-      : await connectionStore.listCompletionTables(props.connectionId!, tableLookupDatabase, tableLookupFilter, MAX_COMPLETION_TABLES, tableLookupSchema)
+      : await listCompletionTablesWithLatencyBudget(props.connectionId!, tableLookupDatabase, tableLookupFilter, MAX_COMPLETION_TABLES, tableLookupSchema)
     : cachedTables;
   if (epoch !== completionEpoch) return null;
 
@@ -1542,7 +1597,7 @@ async function performAsyncCompletionWithResult(epoch: number, completionContext
   if (completionContext.qualifier && !qualifierDatabase && !isReferencedTableQualifier(completionContext) && tables.length === 0 && (completionContext.suggestTables || completionContext.exclusiveColumnSuggestions)) {
     const schemaTables = localOnlyMetadata
       ? connectionStore.lookupLocalCompletionTables(props.connectionId!, props.database!, completionContext.prefix, MAX_COMPLETION_TABLES, completionContext.qualifier)
-      : await connectionStore.listCompletionTables(props.connectionId!, props.database!, completionContext.prefix, MAX_COMPLETION_TABLES, completionContext.qualifier);
+      : await listCompletionTablesWithLatencyBudget(props.connectionId!, props.database!, completionContext.prefix, MAX_COMPLETION_TABLES, completionContext.qualifier);
     if (schemaTables.length > 0) {
       tables = schemaTables;
       qualifierIsSchema = true;
@@ -1919,6 +1974,7 @@ onMounted(async () => {
       previewRangeComp.of(buildPreviewRangeExtension()),
       Prec.highest(
         keymap.of([
+          { key: "'", run: handleSqlSingleQuote },
           ...closeBracketsKeymap,
           { key: "Tab", run: handleTab },
           {
@@ -2221,7 +2277,7 @@ function getCurrentCustomThemeColors() {
 
 // Reactively apply editor settings changes
 watch(
-  [() => settingsStore.editorSettings, () => isDark.value],
+  [queryEditorAppearanceSettings, () => isDark.value],
   async ([ss]) => {
     if (!view.value || !codeMirrorTheme || !fontThemeComp || !wordWrapComp || !runKeymapComp || !editorViewModule) {
       return;
