@@ -53,6 +53,7 @@ import {
   FilePlus,
   SquarePen,
   ListX,
+  Info,
 } from "@lucide/vue";
 import CustomContextMenu, { type ContextMenuItem } from "@/components/ui/CustomContextMenu.vue";
 import { useConnectionStore } from "@/stores/connectionStore";
@@ -888,6 +889,15 @@ async function openData() {
       if (existing) {
         existing.title = node.label;
         existing.schema = tableSchema;
+        // Reset per-table filter/sort state so the reused tab doesn't keep
+        // the previous table's WHERE/ORDER BY. DataGrid remounts (result is
+        // cleared below) and reinitializes its inputs from these props.
+        existing.whereInput = undefined;
+        existing.orderByInput = undefined;
+        existing.resultSortColumn = undefined;
+        existing.resultSortColumnIndex = undefined;
+        existing.resultSortDirection = undefined;
+        existing.resultSortedSql = undefined;
         queryStore.activeTabId = existing.id;
         return existing.id;
       }
@@ -1075,6 +1085,14 @@ async function newQuery() {
 
 // SQL template helpers have been extracted to @/lib/tableSqlTemplates.ts
 // ---- Template actions ----
+
+function openRedisInstanceInfo() {
+  const node = props.node;
+  if (!node.connectionId) return;
+  const config = connectionStore.getConfig(node.connectionId);
+  const dbName = config?.name || "Redis";
+  queryStore.createTab(node.connectionId, "0", `${dbName} - ${t("contextMenu.instanceInfo")}`, "redis-dashboard");
+}
 
 async function loadTemplateContext(allowView = false) {
   const node = props.node;
@@ -3341,6 +3359,9 @@ function treeItemMenuItems(): ContextMenuItem[] {
       items.push({ label: t("contextMenu.closeConnection"), action: disconnectConnection, icon: Unplug });
     }
     items.push({ label: t("contextMenu.newQuery"), action: newQuery, icon: TerminalSquare });
+    if (currentDatabaseType() === "redis") {
+      items.push({ label: t("contextMenu.instanceInfo"), action: openRedisInstanceInfo, icon: Info });
+    }
     const sqlHistoryMenu = savedSqlHistorySubmenu();
     if (sqlHistoryMenu) items.push(sqlHistoryMenu);
     if (supportsDatabaseUserAdmin(currentDatabaseType())) {
