@@ -788,8 +788,9 @@ onBeforeUnmount(() => {
             <Badge v-else-if="data.ttl === -1" variant="outline" class="text-xs cursor-pointer text-muted-foreground hover:bg-accent" @click="startEditTtl">{{ t("redis.noExpiry") }}</Badge>
           </template>
           <div v-else class="flex items-center gap-1">
-            <Input v-model="ttlInput" class="h-6 w-20 text-xs" placeholder="seconds (-1=no expiry)" autofocus @keydown.enter="saveTtl" @keydown.escape="cancelEditTtl" />
-            <Button variant="ghost" size="icon" class="h-6 w-6" @click="saveTtl"><Save class="h-3 w-3" /></Button>
+            <Input v-model="ttlInput" class="h-6 w-20 text-xs" placeholder="seconds (-1=no expiry)" autofocus @keydown.enter="saveTtl" @keydown.escape="cancelEditTtl" @blur="cancelEditTtl" />
+            <!-- mousedown fires before blur so saveTtl starts first; .prevent keeps focus on the Input so blur doesn't cancel the edit prematurely -->
+            <Button variant="ghost" size="icon" class="h-6 w-6" @mousedown.prevent="saveTtl"><Save class="h-3 w-3" /></Button>
           </div>
         </div>
       </div>
