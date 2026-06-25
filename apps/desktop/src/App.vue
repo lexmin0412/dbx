@@ -111,6 +111,8 @@ const setupRequired = ref(false);
 const showConnectionDialog = ref(false);
 const connectionDialogPrefill = ref<ConnectionDeepLinkDraft | null>(null);
 const showSettingsDialog = ref(false);
+const settingsInitialTab = ref("editor");
+const settingsInitialSection = ref<string | undefined>(undefined);
 const showQueryEditorDdlDialog = ref(false);
 const showDriverStore = ref(false);
 const showQuickOpen = ref(false);
@@ -232,6 +234,12 @@ useVisibilityChange();
 const appVersion = ref("");
 const isClassicLayout = computed(() => settingsStore.editorSettings.appLayout === "classic");
 const updateNotificationsEnabled = computed(() => settingsStore.editorSettings.updateNotificationsEnabled);
+
+function openSettings(initialTab = "editor", initialSection?: string) {
+  settingsInitialTab.value = initialTab;
+  settingsInitialSection.value = initialSection;
+  showSettingsDialog.value = true;
+}
 const toolbarAgentDriverUpdateCount = computed(() => (updateNotificationsEnabled.value ? agentDriverUpdateCount.value : 0));
 const toolbarHasUpdateAvailable = computed(() => updateNotificationsEnabled.value && hasUpdateAvailable.value);
 const hasSqlFileConnections = computed(() => connectionStore.connections.some((c) => supportsSqlFileExecution(c.db_type)));
@@ -432,14 +440,42 @@ function defaultSavedSqlName(title: string) {
   return normalized.endsWith(".sql") ? normalized : `${normalized}.sql`;
 }
 
+function canSaveSqlTab(tab: QueryTab): boolean {
+  return !!tab.externalSqlPath || !!tab.sql.trim();
+}
+
+function closePendingSavedTab() {
+  if (!pendingSaveAndCloseTabId.value) return;
+  const closeId = pendingSaveAndCloseTabId.value;
+  pendingSaveAndCloseTabId.value = null;
+  if (pendingPrevActiveTabId.value) queryStore.activeTabId = pendingPrevActiveTabId.value;
+  pendingPrevActiveTabId.value = null;
+  queryStore.closeTab(closeId, { force: true });
+}
+
+async function saveExternalSqlPath(tab: QueryTab, options: { closeAfterSave?: boolean } = {}): Promise<boolean> {
+  if (!tab.externalSqlPath || !isTauriRuntime()) return false;
+  try {
+    await api.writeExternalSqlFile(tab.externalSqlPath, tab.sql);
+    queryStore.markTabClean(tab);
+    toast(t("savedSql.saved"), 2000);
+    if (options.closeAfterSave) queryStore.closeTab(tab.id, { force: true });
+    return true;
+  } catch (e: any) {
+    toast(t("toolbar.sqlSaveFailed", { message: e?.message || String(e) }), 5000);
+    return true;
+  }
+}
+
 async function handleSaveTab(tabId: string) {
   const tab = queryStore.tabs.find((t) => t.id === tabId);
-  if (!tab || !tab.sql.trim()) return;
+  if (!tab || !canSaveSqlTab(tab)) return;
   if (tab.objectSource) {
     const saved = await saveActiveObjectSource(tab);
     if (saved) queryStore.closeTab(tabId, { force: true });
     return;
   }
+  if (await saveExternalSqlPath(tab, { closeAfterSave: true })) return;
   const existing = tab.savedSqlId ? savedSqlStore.getFile(tab.savedSqlId) : undefined;
   if (existing) {
     const updated = await savedSqlStore.saveFile({
@@ -469,11 +505,12 @@ async function handleSaveTab(tabId: string) {
 
 async function openSaveSqlDialog() {
   const tab = activeTab.value;
-  if (!tab || !tab.sql.trim()) return;
+  if (!tab || !canSaveSqlTab(tab)) return;
   if (tab.objectSource) {
     await saveActiveObjectSource(tab);
     return;
   }
+  if (await saveExternalSqlPath(tab)) return;
   const existing = tab.savedSqlId ? savedSqlStore.getFile(tab.savedSqlId) : undefined;
   if (existing) {
     const updated = await savedSqlStore.saveFile({
@@ -542,16 +579,30 @@ async function confirmSaveSqlToLibrary() {
     queryStore.linkSavedSql(tab.id, saved.id, saved.name);
     queryStore.markTabClean(tab);
     showSaveSqlDialog.value = false;
-    if (pendingSaveAndCloseTabId.value) {
-      const closeId = pendingSaveAndCloseTabId.value;
-      pendingSaveAndCloseTabId.value = null;
-      if (pendingPrevActiveTabId.value) queryStore.activeTabId = pendingPrevActiveTabId.value;
-      pendingPrevActiveTabId.value = null;
-      queryStore.closeTab(closeId, { force: true });
-    }
+    closePendingSavedTab();
     toast(t("savedSql.saved"), 2000);
   } catch (e: any) {
     toast(t("savedSql.saveFailed", { message: e?.message || String(e) }), 5000);
+  }
+}
+
+async function saveActiveSqlAsLocalFile() {
+  const tab = activeTab.value;
+  if (!tab || !canSaveSqlTab(tab) || !isTauriRuntime()) return;
+  try {
+    const { save } = await import("@tauri-apps/plugin-dialog");
+    const path = await save({
+      defaultPath: defaultSavedSqlName(tab.title),
+      filters: [{ name: "SQL", extensions: ["sql"] }],
+    });
+    if (!path) return;
+    await api.writeExternalSqlFile(path, tab.sql);
+    queryStore.linkExternalSqlPath(tab.id, path, sqlFileTitleFromPath(path));
+    showSaveSqlDialog.value = false;
+    closePendingSavedTab();
+    toast(t("savedSql.saved"), 2000);
+  } catch (e: any) {
+    toast(t("toolbar.sqlSaveFailed", { message: e?.message || String(e) }), 5000);
   }
 }
 
@@ -566,8 +617,10 @@ async function openSqlFile() {
         multiple: false,
       });
       if (path) {
-        const content = await api.readExternalSqlFile(path as string);
+        const sqlPath = path as string;
+        const content = await api.readExternalSqlFile(sqlPath);
         queryStore.updateSql(tab.id, content);
+        queryStore.linkExternalSqlPath(tab.id, sqlPath, sqlFileTitleFromPath(sqlPath));
       }
     } else {
       const input = document.createElement("input");
@@ -616,6 +669,7 @@ async function openSqlFilePath(path: string) {
     const database = activeTab.value?.database || (connection ? resolveDefaultDatabase(connection, []) : "");
     const tabId = queryStore.createTab(connectionId, database, sqlFileTitleFromPath(path), "query");
     queryStore.updateSql(tabId, content);
+    queryStore.linkExternalSqlPath(tabId, path, sqlFileTitleFromPath(path));
   } catch (e: any) {
     toast(t("toolbar.sqlOpenFailed", { message: e?.message || String(e) }), 5000);
   }
@@ -990,11 +1044,13 @@ async function handleQuickOpenSelect(item: any) {
         await connectionStore.loadRedisDatabases(item.connectionId);
       } else if (config?.db_type === "etcd") {
         await connectionStore.loadEtcdRoot(item.connectionId);
+      } else if (config?.db_type === "zookeeper") {
+        await connectionStore.loadZooKeeperRoot(item.connectionId);
       } else if (config?.db_type === "mongodb") {
         await connectionStore.loadMongoDatabases(item.connectionId);
       } else if (config?.db_type === "elasticsearch") {
         await connectionStore.loadElasticsearchIndices(item.connectionId);
-      } else if (config?.db_type === "qdrant" || config?.db_type === "milvus") {
+      } else if (config?.db_type === "qdrant" || config?.db_type === "milvus" || config?.db_type === "weaviate") {
         await connectionStore.loadVectorCollections(item.connectionId);
       } else if (config?.db_type === "mq") {
         await connectionStore.loadMqTenants(item.connectionId);
@@ -1013,11 +1069,13 @@ async function handleQuickOpenSelect(item: any) {
         await connectionStore.loadRedisDatabases(item.connectionId);
       } else if (config?.db_type === "etcd") {
         await connectionStore.loadEtcdRoot(item.connectionId);
+      } else if (config?.db_type === "zookeeper") {
+        await connectionStore.loadZooKeeperRoot(item.connectionId);
       } else if (config?.db_type === "mongodb") {
         await connectionStore.loadMongoDatabases(item.connectionId);
       } else if (config?.db_type === "elasticsearch") {
         await connectionStore.loadElasticsearchIndices(item.connectionId);
-      } else if (config?.db_type === "qdrant" || config?.db_type === "milvus") {
+      } else if (config?.db_type === "qdrant" || config?.db_type === "milvus" || config?.db_type === "weaviate") {
         await connectionStore.loadVectorCollections(item.connectionId);
       } else if (config?.db_type === "mq") {
         await connectionStore.loadMqTenants(item.connectionId);
@@ -1090,7 +1148,7 @@ function handleKeydown(e: KeyboardEvent) {
   if (isOpenSettingsShortcut(e, shortcuts)) {
     e.preventDefault();
     e.stopPropagation();
-    showSettingsDialog.value = true;
+    openSettings();
     return;
   }
   if (isQuickOpenShortcut(e, shortcuts)) {
@@ -1377,7 +1435,7 @@ onUnmounted(() => {
           @toggle-history="showHistory = !showHistory"
           @toggle-sql-library="toggleSqlLibrary"
           @open-github="openGitHub"
-          @open-settings="showSettingsDialog = true"
+          @open-settings="openSettings()"
           @open-driver-store="showDriverStore = !showDriverStore"
           @check-updates="checkUpdates()"
           @open-transfer="dialogs.showTransferDialog.value = true"
@@ -1480,6 +1538,7 @@ onUnmounted(() => {
                         )
                     "
                     @structure-editor-close="activeTab && queryStore.closeTab(activeTab.id)"
+                    @open-settings="openSettings"
                   />
                 </KeepAlive>
               </div>
@@ -1526,6 +1585,8 @@ onUnmounted(() => {
           :show-connection-dialog="showConnectionDialog"
           :connection-prefill="connectionDialogPrefill"
           :show-settings-dialog="showSettingsDialog"
+          :settings-initial-tab="settingsInitialTab"
+          :settings-initial-section="settingsInitialSection"
           :app-version="appVersion"
           :show-danger-dialog="showDangerDialog"
           :danger-sql="dangerSql"
@@ -1610,6 +1671,7 @@ onUnmounted(() => {
             </div>
           </div>
           <DialogFooter>
+            <Button v-if="isDesktop" variant="secondary" @click="saveActiveSqlAsLocalFile">{{ t("savedSql.saveToFile") }}</Button>
             <Button
               variant="outline"
               @click="

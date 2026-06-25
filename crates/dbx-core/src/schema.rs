@@ -590,6 +590,34 @@ pub async fn list_schemas_core(state: &AppState, connection_id: &str, database: 
     .await
 }
 
+pub async fn list_schema_infos_core(
+    state: &AppState,
+    connection_id: &str,
+    database: &str,
+) -> Result<Vec<db::SchemaInfo>, String> {
+    retry_metadata_connection(state, connection_id, Some(database), || {
+        list_schema_infos_once(state, connection_id, database)
+    })
+    .await
+}
+
+async fn list_schema_infos_once(
+    state: &AppState,
+    connection_id: &str,
+    database: &str,
+) -> Result<Vec<db::SchemaInfo>, String> {
+    let pool_key = state.get_or_create_pool(connection_id, Some(database)).await?;
+    {
+        let connections = state.connections.read().await;
+        if let Some(PoolKind::Postgres(pool)) = connections.get(&pool_key) {
+            return db::postgres::list_schema_infos(pool).await;
+        }
+    }
+
+    let schemas = list_schemas_once(state, connection_id, database).await?;
+    Ok(schemas.into_iter().map(|name| db::SchemaInfo { name, comment: None }).collect())
+}
+
 async fn list_schemas_once(state: &AppState, connection_id: &str, database: &str) -> Result<Vec<String>, String> {
     let pool_key = state.get_or_create_pool(connection_id, Some(database)).await?;
     let db_config = connection_config(state, connection_id).await;
@@ -696,6 +724,36 @@ pub async fn get_table_comment_core(
         {
             let connections = state.connections.read().await;
             try_sqlserver!(connections, &pool_key, get_table_comment, schema, table);
+            if let Some(client) = extract_pool!(&connections, &pool_key, Agent) {
+                if db_config.as_ref().is_some_and(|config| {
+                    matches!(config.db_type, DatabaseType::Oracle | DatabaseType::OceanbaseOracle)
+                }) {
+                    let sql = oracle_table_comment_sql(schema, table);
+                    let timeout = agent_metadata_timeout(db_config.as_ref());
+                    drop(connections);
+                    let mut client = client.lock().await;
+                    let result = client
+                        .execute_query_with_timeout::<db::QueryResult>(
+                            agent_execute_query_params(
+                                &sql,
+                                Some(database),
+                                Some(schema),
+                                QueryExecutionOptions {
+                                    max_rows: Some(1),
+                                    fetch_size: None,
+                                    page_size: None,
+                                    result_session_id: None,
+                                    client_session_id: None,
+                                    timeout_secs: None,
+                                    execution_id: None,
+                                },
+                            ),
+                            timeout,
+                        )
+                        .await?;
+                    return oracle_table_comment_from_query_result(result);
+                }
+            }
         }
 
         let connections = state.connections.read().await;
@@ -716,6 +774,22 @@ pub async fn get_table_comment_core(
         }
     })
     .await
+}
+
+fn oracle_table_comment_sql(schema: &str, table: &str) -> String {
+    format!(
+        "SELECT COMMENTS FROM ALL_TAB_COMMENTS WHERE OWNER = {} AND TABLE_NAME = {} AND TABLE_TYPE IN ('TABLE', 'VIEW')",
+        sql_string(schema),
+        sql_string(table),
+    )
+}
+
+fn oracle_table_comment_from_query_result(result: db::QueryResult) -> Result<Option<String>, String> {
+    Ok(result
+        .rows
+        .first()
+        .and_then(|row| row.iter().find_map(|value| value.as_str().map(str::to_string)))
+        .filter(|value| !value.trim().is_empty()))
 }
 
 async fn list_tables_once(
@@ -1096,7 +1170,8 @@ mod tests {
     use super::{
         clickhouse_metadata_database, deduplicate_column_infos, filter_mysql_system_databases_for_config,
         filter_table_infos, is_agent_postgres_metadata_fallback_config, normalize_information_schema_table_type,
-        presto_like_information_schema_tables_sql, presto_like_tables_from_query_result,
+        oracle_table_comment_from_query_result, oracle_table_comment_sql, presto_like_information_schema_tables_sql,
+        presto_like_tables_from_query_result,
     };
     #[cfg(feature = "duckdb-bundled")]
     use super::{
@@ -1134,6 +1209,7 @@ mod tests {
             password: "secret".to_string(),
             database: Some("demo".to_string()),
             visible_databases: None,
+            visible_schemas: None,
             attached_databases: Vec::new(),
             color: None,
             transport_layers: Vec::new(),
@@ -1437,7 +1513,7 @@ mod tests {
 
     #[test]
     fn postgres_like_agent_metadata_fallback_targets_pg_compatible_agents() {
-        assert!(is_agent_postgres_metadata_fallback_config(&test_connection_config(DatabaseType::Kingbase)));
+        assert!(!is_agent_postgres_metadata_fallback_config(&test_connection_config(DatabaseType::Kingbase)));
         assert!(is_agent_postgres_metadata_fallback_config(&test_connection_config(DatabaseType::Highgo)));
         assert!(is_agent_postgres_metadata_fallback_config(&test_connection_config(DatabaseType::Vastbase)));
         assert!(!is_agent_postgres_metadata_fallback_config(&test_connection_config(DatabaseType::Postgres)));
@@ -1456,6 +1532,48 @@ mod tests {
 
         config.query_timeout_secs = 0;
         assert_eq!(super::agent_metadata_timeout(Some(&config)), None);
+    }
+
+    #[test]
+    fn oracle_table_comment_sql_targets_single_table_and_escapes_literals() {
+        let sql = oracle_table_comment_sql("APP'S", "USER'S");
+
+        assert!(sql.contains("ALL_TAB_COMMENTS"));
+        assert!(sql.contains("OWNER = 'APP''S'"));
+        assert!(sql.contains("TABLE_NAME = 'USER''S'"));
+        assert!(sql.contains("TABLE_TYPE IN ('TABLE', 'VIEW')"));
+        assert!(!sql.contains("ALL_OBJECTS"));
+    }
+
+    #[test]
+    fn oracle_table_comment_from_query_result_returns_optional_non_blank_comment() {
+        let result = db::QueryResult {
+            columns: vec!["COMMENTS".to_string()],
+            column_types: Vec::new(),
+            column_sortables: Vec::new(),
+            rows: vec![vec![serde_json::json!("Customer table")]],
+            affected_rows: 0,
+            execution_time_ms: 0,
+            truncated: false,
+            session_id: None,
+            has_more: false,
+        };
+
+        assert_eq!(oracle_table_comment_from_query_result(result).unwrap().as_deref(), Some("Customer table"));
+
+        let empty = db::QueryResult {
+            columns: vec!["COMMENTS".to_string()],
+            column_types: Vec::new(),
+            column_sortables: Vec::new(),
+            rows: vec![vec![serde_json::json!("  ")]],
+            affected_rows: 0,
+            execution_time_ms: 0,
+            truncated: false,
+            session_id: None,
+            has_more: false,
+        };
+
+        assert_eq!(oracle_table_comment_from_query_result(empty).unwrap(), None);
     }
 }
 
@@ -1661,9 +1779,7 @@ async fn completion_assistant_fallback_core(
         )
         .await?;
         for table in tables {
-            let kind = if table.table_type.eq_ignore_ascii_case("VIEW")
-                || table.table_type.eq_ignore_ascii_case("MATERIALIZED_VIEW")
-            {
+            let kind = if table.table_type.to_uppercase().contains("VIEW") {
                 db::CompletionAssistantCandidateKind::View
             } else {
                 db::CompletionAssistantCandidateKind::Table
@@ -2010,7 +2126,9 @@ fn filter_completion_objects(objects: Vec<db::ObjectInfo>) -> Vec<db::ObjectInfo
 }
 
 fn is_agent_postgres_metadata_fallback_config(config: &ConnectionConfig) -> bool {
-    matches!(config.db_type, DatabaseType::Kingbase | DatabaseType::Highgo | DatabaseType::Vastbase)
+    // Kingbase has dedicated agent metadata SQL and may carry JDBC-specific URL
+    // parameters that the native PostgreSQL driver cannot parse.
+    matches!(config.db_type, DatabaseType::Highgo | DatabaseType::Vastbase)
 }
 
 async fn native_postgres_metadata_pool(
@@ -2699,7 +2817,9 @@ pub fn postgres_object_source_sql(schema: &str, name: &str, kind: &db::ObjectSou
     match kind {
         db::ObjectSourceKind::View | db::ObjectSourceKind::MaterializedView => {
             format!(
-                "SELECT pg_get_viewdef(c.oid, 0) \
+                "SELECT CASE WHEN c.relkind = 'm' THEN format('CREATE MATERIALIZED VIEW %I.%I AS ', n.nspname, c.relname) || regexp_replace(pg_get_viewdef(c.oid, 0), ';[[:space:]]*$', '') || CASE WHEN c.relispopulated THEN ' WITH DATA' ELSE ' WITH NO DATA' END \
+                 ELSE format('CREATE OR REPLACE VIEW %I.%I AS ', n.nspname, c.relname) || pg_get_viewdef(c.oid, 0) \
+                 END \
                  FROM pg_catalog.pg_class c \
                  JOIN pg_catalog.pg_namespace n ON n.oid = c.relnamespace \
                  WHERE n.nspname = {} AND c.relname = {} AND c.relkind IN ('v','m') \
@@ -3058,7 +3178,7 @@ mod object_source_tests {
     fn builds_postgres_object_source_sql_for_views_and_functions() {
         assert_eq!(
             postgres_object_source_sql("public", "active_users", &ObjectSourceKind::View),
-            "SELECT pg_get_viewdef(c.oid, 0) FROM pg_catalog.pg_class c JOIN pg_catalog.pg_namespace n ON n.oid = c.relnamespace WHERE n.nspname = 'public' AND c.relname = 'active_users' AND c.relkind IN ('v','m') ORDER BY c.oid LIMIT 1"
+            "SELECT CASE WHEN c.relkind = 'm' THEN format('CREATE MATERIALIZED VIEW %I.%I AS ', n.nspname, c.relname) || regexp_replace(pg_get_viewdef(c.oid, 0), ';[[:space:]]*$', '') || CASE WHEN c.relispopulated THEN ' WITH DATA' ELSE ' WITH NO DATA' END ELSE format('CREATE OR REPLACE VIEW %I.%I AS ', n.nspname, c.relname) || pg_get_viewdef(c.oid, 0) END FROM pg_catalog.pg_class c JOIN pg_catalog.pg_namespace n ON n.oid = c.relnamespace WHERE n.nspname = 'public' AND c.relname = 'active_users' AND c.relkind IN ('v','m') ORDER BY c.oid LIMIT 1"
         );
         assert_eq!(
             postgres_object_source_sql("public", "recalc_score", &ObjectSourceKind::Function),
@@ -3072,6 +3192,7 @@ mod object_source_tests {
 
         assert!(!sql.contains("::regclass"));
         assert!(sql.contains("pg_get_viewdef(c.oid, 0)"));
+        assert!(sql.contains("format('CREATE OR REPLACE VIEW %I.%I AS ', n.nspname, c.relname)"));
         assert!(sql.contains("n.nspname = 'tenant''s schema'"));
         assert!(sql.contains("c.relname = 'active users'"));
         assert!(sql.contains("c.relkind IN ('v','m')"));

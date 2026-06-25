@@ -25,7 +25,7 @@ use crate::types::{
     ColumnInfo, CompletionAssistantCandidate, CompletionAssistantCandidateKind, CompletionAssistantMatchMode,
     CompletionAssistantObjectKind, CompletionAssistantRequest, CompletionAssistantResponse, DatabaseInfo,
     ForeignKeyInfo, FunctionInfo, IndexInfo, ObjectInfo, ObjectStatistics, OwnerInfo, QueryResult, RuleInfo,
-    SequenceInfo, TableInfo, TriggerInfo,
+    SchemaInfo, SequenceInfo, TableInfo, TriggerInfo,
 };
 
 fn pg_temporal_to_json_value(row: &Row, idx: usize) -> Option<serde_json::Value> {
@@ -1153,7 +1153,7 @@ pub async fn completion_assistant_search(
             let table_type: String = row.get(2);
             candidates.push(CompletionAssistantCandidate {
                 name: row.get(0),
-                kind: if table_type == "VIEW" {
+                kind: if table_type.contains("VIEW") {
                     CompletionAssistantCandidateKind::View
                 } else {
                     CompletionAssistantCandidateKind::Table
@@ -1479,10 +1479,19 @@ pub async fn list_object_statistics(pool: &Pool, schema: &str) -> Result<Vec<Obj
 }
 
 pub async fn list_schemas(pool: &Pool) -> Result<Vec<String>, String> {
+    Ok(list_schema_infos(pool).await?.into_iter().map(|schema| schema.name).collect())
+}
+
+pub async fn list_schema_infos(pool: &Pool) -> Result<Vec<SchemaInfo>, String> {
     let client = pool.get().await.map_err(|e| e.to_string())?;
     let stmt = client
         .prepare_cached(
-            "SELECT n.nspname AS schema_name FROM pg_catalog.pg_namespace n \
+            "SELECT n.nspname AS schema_name, d.description AS schema_comment \
+             FROM pg_catalog.pg_namespace n \
+             LEFT JOIN pg_catalog.pg_description d \
+               ON d.objoid = n.oid \
+              AND d.objsubid = 0 \
+              AND d.classoid = 'pg_namespace'::regclass \
              WHERE n.nspname NOT IN ('information_schema', 'pg_catalog', 'pg_toast') \
              AND n.nspname NOT LIKE 'pg_toast_temp_%' \
              AND n.nspname NOT LIKE 'pg_temp_%' \
@@ -1492,7 +1501,13 @@ pub async fn list_schemas(pool: &Pool) -> Result<Vec<String>, String> {
         .map_err(|e| e.to_string())?;
     let rows = client.query(&stmt, &[]).await.map_err(|e| e.to_string())?;
 
-    Ok(rows.iter().map(|row| row.get::<_, String>(0)).collect())
+    Ok(rows
+        .iter()
+        .map(|row| SchemaInfo {
+            name: row.get::<_, String>(0),
+            comment: row.try_get::<_, Option<String>>(1).ok().flatten(),
+        })
+        .collect())
 }
 
 const POSTGRES_COLUMNS_SQL: &str = "SELECT a.attname AS column_name, \
@@ -1937,7 +1952,15 @@ const POSTGRES_INDEXES_SQL: &str = "SELECT i.relname AS index_name, \
              ORDER BY i.relname";
 
 const POSTGRES_INDEXES_COMPAT_SQL: &str = "SELECT i.relname AS index_name, \
-             array_agg(COALESCE(a.attname, pg_get_indexdef(ix.indexrelid, k.n::int, true)) ORDER BY k.n) AS columns, \
+             ARRAY( \
+               SELECT COALESCE(a.attname, pg_get_indexdef(ix.indexrelid, pos.n, true)) \
+               FROM generate_series(1, array_length(string_to_array(ix.indkey::text, ' '), 1)) AS pos(n) \
+               LEFT JOIN pg_attribute a \
+                 ON a.attrelid = t.oid \
+                AND a.attnum = (string_to_array(ix.indkey::text, ' '))[pos.n]::int2 \
+                AND a.attnum > 0 \
+               ORDER BY pos.n \
+             ) AS columns, \
              ix.indisunique AS is_unique, \
              ix.indisprimary AS is_primary, \
              pg_get_expr(ix.indpred, ix.indrelid) AS filter_expr, \
@@ -1950,10 +1973,7 @@ const POSTGRES_INDEXES_COMPAT_SQL: &str = "SELECT i.relname AS index_name, \
              JOIN pg_class i ON i.oid = ix.indexrelid \
              JOIN pg_namespace n ON n.oid = t.relnamespace \
              JOIN pg_am am ON am.oid = i.relam \
-             JOIN LATERAL unnest(ix.indkey) WITH ORDINALITY AS k(attnum, n) ON true \
-             LEFT JOIN pg_attribute a ON a.attrelid = t.oid AND a.attnum = k.attnum AND k.attnum > 0 \
              WHERE n.nspname = $1 AND t.relname = $2 \
-             GROUP BY i.relname, i.oid, ix.indisunique, ix.indisprimary, ix.indpred, ix.indrelid, am.amname, ix.indkey \
              ORDER BY i.relname";
 
 const POSTGRES_OWNERS_SQL: &str =
@@ -2747,6 +2767,10 @@ mod tests {
         assert!(POSTGRES_INDEXES_SQL.contains("ix.indnkeyatts"));
         assert!(!POSTGRES_INDEXES_COMPAT_SQL.contains("ix.indnkeyatts"));
         assert!(POSTGRES_INDEXES_COMPAT_SQL.contains("NULL::smallint AS nkeyatts"));
+        assert!(!POSTGRES_INDEXES_COMPAT_SQL.contains("LATERAL"));
+        assert!(!POSTGRES_INDEXES_COMPAT_SQL.contains("WITH ORDINALITY"));
+        assert!(POSTGRES_INDEXES_COMPAT_SQL.contains("generate_series"));
+        assert!(POSTGRES_INDEXES_COMPAT_SQL.contains("string_to_array(ix.indkey::text, ' ')"));
     }
 
     #[test]

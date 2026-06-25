@@ -26,6 +26,7 @@ import { applyParsedConnectionUrl, normalizeMongoConnectionString, parseConnecti
 import type { ConnectionDeepLinkDraft } from "@/lib/connectionDeepLink";
 import { connectionUrlPlaceholder as getUrlPlaceholder } from "@/lib/connectionPresentation";
 import { h2ConnectionModeForConfig, h2FileJdbcUrl, h2FilePathFromJdbcUrl, type H2ConnectionMode } from "@/lib/h2Connection";
+import { firstZooKeeperEndpoint, normalizeZooKeeperConnectString } from "@/lib/zookeeperConnection";
 import { isLocalFileTypeDb } from "@/lib/connectionFile";
 import { MQ_PINNED_VERSION_OPTIONS, pinnedVersionToSelection, selectionToPinnedVersion } from "@/lib/mqPinnedVersionOptions";
 import { mongodbAuthFailureHint, mongoUrlParam, setMongoUrlParam } from "@/lib/mongoConnectionOptions";
@@ -35,7 +36,9 @@ import { prestoSqlBuiltinDriverPaths } from "@/lib/prestoSqlBuiltinDriver";
 import { SQLITE_DATABASE_FILE_EXTENSIONS } from "@/lib/databaseFileDetection";
 import { ArrowLeft, ArrowDown, ArrowUp, CheckSquare, ChevronRight, CircleHelp, Copy, ExternalLink, FilePlus2, FolderOpen, GripVertical, Grid3X3, KeyRound, Link2, List, ListFilter, Loader2, Pipette, Plus, Search, ShieldCheck, Square, Trash2 } from "@lucide/vue";
 import { buildDraftVisibleDatabasesConnectionId, connectionCanChooseVisibleDatabases, initialVisibleDatabaseSelection, visibleDatabaseSelectionIsStale } from "@/lib/connectionVisibleDatabases";
-import { canSaveVisibleDatabaseSelection, filterDatabaseNamesForConnection, isSystemDatabaseName, normalizeVisibleDatabaseSelection } from "@/lib/visibleDatabases";
+import { canSaveVisibleDatabaseSelection, filterDatabaseNamesForConnection, isSystemDatabaseName, normalizeVisibleDatabaseSelection, buildDraftVisibleSchemasConnectionId } from "@/lib/visibleDatabases";
+import { isSchemaAware } from "@/lib/databaseFeatureSupport";
+import VisibleSchemasDialog from "@/components/sidebar/VisibleSchemasDialog.vue";
 
 type DbOption = { value: string; label: string };
 type DbCategory = { key: string; title: string; options: DbOption[] };
@@ -105,6 +108,11 @@ const visibleDatabaseSelection = ref<Set<string>>(new Set());
 const visibleDatabaseSearchText = ref("");
 const visibleDatabaseError = ref("");
 const visibleDatabaseShowSystem = ref(false);
+const showVisibleSchemasDialog = ref(false);
+const isLoadingVisibleSchemas = ref(false);
+const visibleSchemaNames = ref<string[]>([]);
+const visibleSchemaInitialSelection = ref<string[]>([]);
+const visibleSchemaError = ref("");
 let testRunId = 0;
 
 const defaultForm = (): ConnectionForm => ({
@@ -426,6 +434,7 @@ const driverProfiles: Record<
   },
   qdrant: { type: "qdrant", port: 6333, user: "", label: "Qdrant", icon: "qdrant" },
   milvus: { type: "milvus", port: 19530, user: "root", label: "Milvus", icon: "milvus" },
+  weaviate: { type: "weaviate", port: 8080, user: "", label: "Weaviate", icon: "weaviate" },
   mariadb: { type: "mysql", port: 3306, user: "root", label: "MariaDB", icon: "mariadb" },
   tidb: { type: "mysql", port: 4000, user: "root", label: "TiDB", icon: "tidb" },
   oceanbase: { type: "mysql", port: 2881, user: "root", label: "OceanBase", icon: "oceanbase" },
@@ -522,6 +531,7 @@ const driverProfiles: Record<
   xugu: { type: "xugu", port: 5138, user: "", label: "虚谷 XuguDB", icon: "xugu" },
   iotdb: { type: "iotdb", port: 6667, user: "root", label: "Apache IoTDB", icon: "iotdb" },
   etcd: { type: "etcd", port: 2379, user: "", label: "etcd", icon: "etcd" },
+  zookeeper: { type: "zookeeper", port: 2181, user: "", label: "Apache ZooKeeper", icon: "zookeeper" },
   mq: { type: "mq", port: 8080, user: "", label: "Apache Pulsar", icon: "pulsar", host: "127.0.0.1" },
   nacos: { type: "nacos", port: 8848, user: "nacos", label: "Nacos", icon: "nacos", host: "127.0.0.1" },
   iris: { type: "iris", port: 1972, user: "_SYSTEM", label: "IRIS", icon: "iris" },
@@ -798,6 +808,14 @@ function applyProfile(val: string, preserveConnectionFields = false) {
       form.value.database = undefined;
       form.value.connection_string = undefined;
     }
+    if (profile.type === "zookeeper") {
+      form.value.database = undefined;
+      form.value.connection_string = "";
+      form.value.ssl = false;
+      form.value.ca_cert_path = "";
+      form.value.client_cert_path = "";
+      form.value.client_key_path = "";
+    }
     if (profile.type === "nacos") {
       resetNacosFields();
       form.value.database = undefined;
@@ -969,6 +987,7 @@ function onDbTypeChange(val: string) {
   customDriverName.value = "";
   applyProfile(val, !!editingId.value);
   resetTestState();
+  resetVisibleSchemasState();
 }
 
 function switchH2ConnectionMode(mode: H2ConnectionMode) {
@@ -1006,6 +1025,7 @@ const iconTypeMap: Record<string, string> = {
   elasticsearch: "elasticsearch",
   qdrant: "qdrant",
   milvus: "milvus",
+  weaviate: "weaviate",
   mariadb: "mariadb",
   tidb: "tidb",
   oceanbase: "oceanbase",
@@ -1040,6 +1060,7 @@ const iconTypeMap: Record<string, string> = {
   xugu: "xugu",
   iotdb: "iotdb",
   etcd: "etcd",
+  zookeeper: "zookeeper",
   mq: "mq",
   nacos: "nacos",
   dm: "dm",
@@ -1073,6 +1094,7 @@ const dbOptions: DbOption[] = [
   { value: "elasticsearch", label: "Elasticsearch" },
   { value: "qdrant", label: "Qdrant" },
   { value: "milvus", label: "Milvus" },
+  { value: "weaviate", label: "Weaviate" },
   { value: "dm", label: "DM (Dameng)" },
   { value: "opengauss", label: "openGauss" },
   { value: "turso", label: "Turso" },
@@ -1123,6 +1145,7 @@ const dbOptions: DbOption[] = [
   { value: "xugu", label: "虚谷 XuguDB" },
   { value: "iotdb", label: "Apache IoTDB" },
   { value: "etcd", label: "etcd" },
+  { value: "zookeeper", label: "Apache ZooKeeper" },
   { value: "mq", label: "Apache Pulsar" },
   { value: "nacos", label: "Nacos" },
   { value: "influxdb", label: "InfluxDB" },
@@ -1178,7 +1201,7 @@ const sqliteExtensionPaths = computed({
     form.value.url_params = setSqliteExtensionPaths(form.value.url_params, value);
   },
 });
-const tlsCapableDatabaseTypes = new Set<DatabaseType>(["mysql", "postgres", "redshift", "gaussdb", "kwdb", "opengauss", "questdb", "redis", "etcd", "clickhouse", "elasticsearch", "qdrant", "milvus", "influxdb"]);
+const tlsCapableDatabaseTypes = new Set<DatabaseType>(["mysql", "postgres", "redshift", "gaussdb", "kwdb", "opengauss", "questdb", "redis", "etcd", "clickhouse", "elasticsearch", "qdrant", "milvus", "weaviate", "influxdb"]);
 const supportsTlsToggle = computed(() => tlsCapableDatabaseTypes.has(form.value.db_type));
 const supportsCaCertificatePath = computed(() => form.value.db_type === "clickhouse");
 const supportsGenericUrlParams = computed(() => form.value.db_type !== "manticoresearch");
@@ -1248,6 +1271,12 @@ const etcdEndpointsLines = computed({
     form.value.etcd_endpoints = normalizeEndpointLines(value);
   },
 });
+const zookeeperConnectString = computed({
+  get: () => form.value.connection_string || "",
+  set: (value: string) => {
+    form.value.connection_string = normalizeZooKeeperConnectString(value);
+  },
+});
 const canUseTransportLayers = computed(() => form.value.db_type !== "sqlite" && form.value.db_type !== "access" && !isH2FileMode.value);
 const shouldShowAgentDriverInstallHint = computed(() => showAgentDriverInstallHint(form.value.db_type, agentDrivers.value, form.value.driver_profile));
 const h2DriverMissing = computed(() => form.value.db_type === "h2" && isH2FileMode.value && agentDrivers.value.find((d) => d.db_type === "h2")?.installed !== true);
@@ -1275,12 +1304,25 @@ const visibleDatabaseHasSystemDatabases = computed(() => {
   const connection = connectionConfigSnapshotForVisibleDatabases();
   return visibleDatabaseNames.value.some((database) => isSystemDatabaseName(connection.db_type, database));
 });
+const canChooseVisibleSchemas = computed(() => isSchemaAware(form.value.db_type));
+const visibleSchemasDatabaseKey = computed(() => form.value.database || "");
+const hasVisibleSchemaFilter = computed(() => {
+  const key = visibleSchemasDatabaseKey.value;
+  return Array.isArray(form.value.visible_schemas?.[key]);
+});
+const visibleSchemaSummary = computed(() => {
+  const key = visibleSchemasDatabaseKey.value;
+  const configured = form.value.visible_schemas?.[key];
+  if (!configured?.length) return t("visibleSchemas.showAll");
+  return t("visibleSchemas.selectedCount", { selected: configured.length, total: visibleSchemaNames.value.length });
+});
 const testResultMessage = computed(() => {
   if (!testResult.value) return "";
   return testResult.value.ok ? t("connection.testSuccess") : testResult.value.message;
 });
 const hasRequiredConnectionTarget = computed(() => {
   if (form.value.db_type === "mq") return !!mqAdminUrl.value.trim();
+  if (form.value.db_type === "zookeeper") return !!(form.value.host || form.value.connection_string || connectionUrlInput.value.trim());
   if (form.value.db_type === "nacos") return !!nacosServerAddr.value.trim();
   if (isH2FileMode.value) return !!(form.value.host.trim() || h2FilePathFromJdbcUrl(form.value.connection_string));
   return !!(form.value.host || (mongoUseUrl.value && form.value.connection_string) || (form.value.db_type === "jdbc" && form.value.connection_string) || connectionUrlInput.value.trim());
@@ -1497,6 +1539,17 @@ function connectionConfigForSubmit(id: string): ConnectionConfig {
   if (config.db_type === "redis") {
     config.redis_key_separator = config.redis_key_separator?.trim() ?? ":";
   }
+  if (config.db_type === "zookeeper") {
+    const normalizedConnectString = normalizeZooKeeperConnectString(config.connection_string || "");
+    config.connection_string = normalizedConnectString || undefined;
+    const firstEndpoint = firstZooKeeperEndpoint(normalizedConnectString || (config.host ? `${config.host}:${config.port || 2181}` : ""));
+    if (firstEndpoint) {
+      config.host = firstEndpoint.host;
+      config.port = firstEndpoint.port;
+    }
+    config.database = undefined;
+    config.ssl = false;
+  }
   if (config.db_type === "etcd") {
     config.etcd_endpoints = normalizeEndpointLines(config.etcd_endpoints || "");
     const firstEndpoint = firstEtcdEndpoint(config.etcd_endpoints);
@@ -1574,6 +1627,7 @@ function connectionConfigForSubmit(id: string): ConnectionConfig {
   delete legacy.proxy_username;
   delete legacy.proxy_password;
   config.visible_databases = Array.isArray(config.visible_databases) && config.visible_databases.length > 0 ? config.visible_databases : undefined;
+  if (config.visible_schemas && Object.keys(config.visible_schemas).length === 0) config.visible_schemas = undefined;
   return config as ConnectionConfig;
 }
 
@@ -1896,6 +1950,57 @@ function saveVisibleDatabaseSelection() {
   showVisibleDatabasesDialog.value = false;
 }
 
+function resetVisibleSchemasState() {
+  showVisibleSchemasDialog.value = false;
+  isLoadingVisibleSchemas.value = false;
+  visibleSchemaNames.value = [];
+  visibleSchemaInitialSelection.value = [];
+  visibleSchemaError.value = "";
+}
+
+async function openVisibleSchemasPicker() {
+  if (!ensureConnectionHostResolvedFromUrl()) return;
+  if (!canChooseVisibleSchemas.value || isLoadingVisibleSchemas.value) return;
+  isLoadingVisibleSchemas.value = true;
+  visibleSchemaError.value = "";
+  const draftId = buildDraftVisibleSchemasConnectionId(uuid());
+  try {
+    const draftConfig: ConnectionConfig = {
+      ...connectionConfigForSubmit(draftId),
+      id: draftId,
+    };
+    await store.addEphemeralConnection(draftConfig);
+    await store.ensureConnected(draftId);
+    const names = await api.listSchemas(draftId, visibleSchemasDatabaseKey.value);
+    visibleSchemaNames.value = names;
+    const key = visibleSchemasDatabaseKey.value;
+    const configured = form.value.visible_schemas?.[key];
+    visibleSchemaInitialSelection.value = Array.isArray(configured) ? configured : [];
+    showVisibleSchemasDialog.value = true;
+  } catch (e: any) {
+    visibleSchemaNames.value = [];
+    visibleSchemaInitialSelection.value = [];
+    visibleSchemaError.value = String(e?.message || e);
+  } finally {
+    isLoadingVisibleSchemas.value = false;
+    store.removeConnection(draftId).catch(() => {});
+  }
+}
+
+function handleDraftSchemasSave(selectedNames: string[]) {
+  const key = visibleSchemasDatabaseKey.value;
+  form.value.visible_schemas = { ...(form.value.visible_schemas || {}), [key]: selectedNames };
+}
+
+function handleDraftSchemasShowAll() {
+  const key = visibleSchemasDatabaseKey.value;
+  if (form.value.visible_schemas) {
+    const next = { ...form.value.visible_schemas };
+    delete next[key];
+    form.value.visible_schemas = Object.keys(next).length > 0 ? next : undefined;
+  }
+}
+
 function applyConnectionUrl() {
   if (applyConnectionUrlToForm(connectionUrlInput.value)) {
     toast(t("connection.parseConnectionUrlApplied"), 2000);
@@ -1930,6 +2035,7 @@ function resetForm() {
   dbSearchQuery.value = "";
   configTab.value = "connection";
   resetVisibleDatabaseDraftState();
+  resetVisibleSchemasState();
   resetTestState();
 }
 
@@ -2139,9 +2245,9 @@ function validateTransportLayers(config: LegacyConnectionConfig) {
     }
     if (layer.type === "ssh") {
       if (!layer.user?.trim()) throw new Error(t("connection.sshHopInvalidUser", { hop: label }));
-      if (!layer.password?.trim() && !layer.key_path?.trim() && !layer.use_ssh_agent) {
-        throw new Error(t("connection.sshHopInvalidAuth", { hop: label }));
-      }
+      // Auth credentials are optional: the backend probes "none" authentication
+      // first, so hops that require no credential (e.g. passwordless SSH proxies)
+      // are valid with password, key, and agent all left empty.
       const timeout = Number(layer.connect_timeout_secs);
       if (!Number.isFinite(timeout) || timeout < 1 || timeout > 300) {
         throw new Error(t("connection.sshHopInvalidTimeout", { hop: label }));
@@ -3080,6 +3186,37 @@ function openExternalUrl(url: string) {
                   </div>
                 </template>
 
+                <!-- ZooKeeper: host, connect string, user, password -->
+                <template v-else-if="form.db_type === 'zookeeper'">
+                  <div class="grid grid-cols-4 items-center gap-4">
+                    <Label class="text-right">{{ t("connection.host") }}</Label>
+                    <Input v-model="form.host" class="col-span-2" placeholder="127.0.0.1" />
+                    <Input v-model.number="form.port" type="number" class="col-span-1" />
+                  </div>
+                  <div class="grid grid-cols-4 items-start gap-4">
+                    <Label class="text-right mt-2">{{ t("connection.zookeeperConnectString") }}</Label>
+                    <div class="col-span-3 space-y-1">
+                      <textarea
+                        v-model="zookeeperConnectString"
+                        class="flex min-h-[76px] w-full rounded-md border border-input bg-transparent px-3 py-2 text-sm shadow-sm placeholder:text-muted-foreground focus-visible:outline-none focus-visible:ring-1 focus-visible:ring-ring"
+                        placeholder="127.0.0.1:2181&#10;zk-2:2181"
+                        spellcheck="false"
+                      />
+                      <p class="text-xs text-muted-foreground">
+                        {{ t("connection.zookeeperConnectStringHint") }}
+                      </p>
+                    </div>
+                  </div>
+                  <div class="grid grid-cols-4 items-center gap-4">
+                    <Label class="text-right">{{ t("connection.user") }}</Label>
+                    <Input v-model="form.username" class="col-span-3" />
+                  </div>
+                  <div class="grid grid-cols-4 items-center gap-4">
+                    <Label class="text-right">{{ t("connection.password") }}</Label>
+                    <PasswordInput v-model="form.password" class="col-span-3" />
+                  </div>
+                </template>
+
                 <!-- MongoDB: URL or form -->
                 <template v-else-if="form.db_type === 'mongodb'">
                   <div class="grid grid-cols-4 items-center gap-4">
@@ -3832,6 +3969,11 @@ function openExternalUrl(url: string) {
             <ListFilter v-else class="mr-1.5 h-4 w-4" />
             {{ hasVisibleDatabaseFilter ? visibleDatabaseSummary : t("contextMenu.selectVisibleDatabases") }}
           </Button>
+          <Button v-if="canChooseVisibleSchemas" variant="outline" class="shrink-0" :disabled="isTesting || isSaving || isLoadingVisibleSchemas || !hasRequiredConnectionTarget" @click="openVisibleSchemasPicker">
+            <Loader2 v-if="isLoadingVisibleSchemas" class="mr-1.5 h-4 w-4 animate-spin" />
+            <ListFilter v-else class="mr-1.5 h-4 w-4" />
+            {{ hasVisibleSchemaFilter ? visibleSchemaSummary : t("visibleSchemas.showAll") }}
+          </Button>
           <Button variant="outline" class="shrink-0" :disabled="isTesting || isSaving" @click="testConnection">
             {{ isTesting ? t("connection.testing") : t("connection.test") }}
           </Button>
@@ -3921,4 +4063,18 @@ function openExternalUrl(url: string) {
       </DialogFooter>
     </DialogContent>
   </Dialog>
+
+  <VisibleSchemasDialog
+    v-model:open="showVisibleSchemasDialog"
+    draft-mode
+    :connection-id="''"
+    :connection-name="form.name || selectedProfile().label"
+    :database="visibleSchemasDatabaseKey"
+    :draft-schema-names="visibleSchemaNames"
+    :draft-initial-selection="visibleSchemaInitialSelection"
+    :draft-loading="isLoadingVisibleSchemas"
+    :draft-error="visibleSchemaError"
+    @draft:save="handleDraftSchemasSave"
+    @draft:show-all="handleDraftSchemasShowAll"
+  />
 </template>

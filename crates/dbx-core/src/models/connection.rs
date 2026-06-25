@@ -1,6 +1,7 @@
 use percent_encoding::{percent_decode_str, utf8_percent_encode, NON_ALPHANUMERIC};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
+use std::collections::HashMap;
 
 #[derive(Debug, Clone, Serialize, PartialEq)]
 pub struct ConnectionConfig {
@@ -20,6 +21,8 @@ pub struct ConnectionConfig {
     pub database: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub visible_databases: Option<Vec<String>>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub visible_schemas: Option<HashMap<String, Vec<String>>>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub attached_databases: Vec<AttachedDatabaseConfig>,
     #[serde(default)]
@@ -258,6 +261,8 @@ pub enum DatabaseType {
     Qdrant,
     #[serde(rename = "milvus")]
     Milvus,
+    #[serde(rename = "weaviate")]
+    Weaviate,
     Doris,
     #[serde(rename = "starrocks")]
     StarRocks,
@@ -307,6 +312,8 @@ pub enum DatabaseType {
     Xugu,
     Iotdb,
     Etcd,
+    #[serde(rename = "zookeeper")]
+    ZooKeeper,
     Nacos,
     #[serde(rename = "iris")]
     Iris,
@@ -341,6 +348,8 @@ struct ConnectionConfigData {
     pub database: Option<String>,
     #[serde(default)]
     pub visible_databases: Option<Vec<String>>,
+    #[serde(default)]
+    pub visible_schemas: Option<HashMap<String, Vec<String>>>,
     #[serde(default)]
     pub attached_databases: Vec<AttachedDatabaseConfig>,
     #[serde(default)]
@@ -418,6 +427,7 @@ impl From<ConnectionConfigData> for ConnectionConfig {
             password: data.password,
             database: data.database,
             visible_databases: data.visible_databases,
+            visible_schemas: data.visible_schemas,
             attached_databases: data.attached_databases,
             color: data.color,
             transport_layers: data.transport_layers,
@@ -733,7 +743,7 @@ impl ConnectionConfig {
                 format!("mongodb://{host}:{port}{db_part}{suffix}")
             }
             DatabaseType::Oracle => format!("oracle://{host}:{port}{db_part}"),
-            DatabaseType::Elasticsearch | DatabaseType::Qdrant | DatabaseType::Milvus => {
+            DatabaseType::Elasticsearch | DatabaseType::Qdrant | DatabaseType::Milvus | DatabaseType::Weaviate => {
                 let scheme = if self.ssl { "https" } else { "http" };
                 format!("{scheme}://{host}:{port}")
             }
@@ -786,6 +796,9 @@ impl ConnectionConfig {
             }
             DatabaseType::Etcd => {
                 format!("etcd://{host}:{port}")
+            }
+            DatabaseType::ZooKeeper => {
+                format!("zookeeper://{host}:{port}")
             }
             DatabaseType::Iris => format!("iris://{host}:{port}{db_part}"),
             DatabaseType::InfluxDb => {
@@ -869,7 +882,7 @@ impl ConnectionConfig {
             DatabaseType::Oracle => {
                 format!("oracle://{}:{}@{host}:{port}{db_part}", username, password)
             }
-            DatabaseType::Elasticsearch | DatabaseType::Qdrant | DatabaseType::Milvus => {
+            DatabaseType::Elasticsearch | DatabaseType::Qdrant | DatabaseType::Milvus | DatabaseType::Weaviate => {
                 let scheme = if self.ssl { "https" } else { "http" };
                 format!("{scheme}://{host}:{port}")
             }
@@ -987,6 +1000,13 @@ impl ConnectionConfig {
                     format!("etcd://{host}:{port}")
                 } else {
                     format!("etcd://{}:{}@{host}:{port}", username, password)
+                }
+            }
+            DatabaseType::ZooKeeper => {
+                if self.username.is_empty() {
+                    format!("zookeeper://{host}:{port}")
+                } else {
+                    format!("zookeeper://{}:{}@{host}:{port}", username, password)
                 }
             }
             DatabaseType::Iris => {
@@ -1529,6 +1549,7 @@ mod tests {
             password: password.to_string(),
             database: database.map(str::to_string),
             visible_databases: None,
+            visible_schemas: None,
             attached_databases: Vec::new(),
             color: None,
             transport_layers: Vec::new(),
@@ -1567,6 +1588,27 @@ mod tests {
         config.db_type = DatabaseType::MongoDb;
         config.port = 17000;
         config
+    }
+
+    #[test]
+    fn zookeeper_database_type_uses_stable_wire_name() {
+        assert_eq!(serde_json::to_string(&DatabaseType::ZooKeeper).unwrap(), "\"zookeeper\"");
+        assert_eq!(serde_json::from_str::<DatabaseType>("\"zookeeper\"").unwrap(), DatabaseType::ZooKeeper);
+    }
+
+    #[test]
+    fn zookeeper_connection_url_uses_zookeeper_scheme() {
+        let mut config = mysql_config("", "", None);
+        config.db_type = DatabaseType::ZooKeeper;
+        config.host = "zk.local".to_string();
+        config.port = 2181;
+
+        assert_eq!(config.connection_url_with_host("zk.local", 2181), "zookeeper://zk.local:2181");
+
+        config.username = "digest".to_string();
+        config.password = "secret".to_string();
+
+        assert_eq!(config.connection_url_with_host("zk.local", 2181), "zookeeper://digest:secret@zk.local:2181");
     }
 
     #[test]

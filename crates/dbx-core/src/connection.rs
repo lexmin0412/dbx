@@ -117,6 +117,7 @@ macro_rules! agent_connection_pool_database_type {
             | DatabaseType::Xugu
             | DatabaseType::Iotdb
             | DatabaseType::Etcd
+            | DatabaseType::ZooKeeper
             | DatabaseType::Iris
             | DatabaseType::Access
     };
@@ -538,7 +539,19 @@ impl AppState {
                             }
                             break;
                         }
-                        Err(_) => log::warn!("Connection keepalive timed out for '{key}' after {}s", timeout.as_secs()),
+                        Err(_) => {
+                            log::warn!(
+                                "Connection keepalive timed out for '{key}' after {}s; invalidating pool",
+                                timeout.as_secs()
+                            );
+                            keepalive_tasks.write().await.remove(&key);
+                            pool_activity.write().await.remove(&key);
+                            let removed = connections.write().await.remove(&key);
+                            if let Some(pool) = removed {
+                                close_pool_kind_with_timeout(key, pool).await;
+                            }
+                            break;
+                        }
                     }
                 }
             }
@@ -819,10 +832,11 @@ impl AppState {
                 db::elasticsearch_driver::test_connection(&mut client, connect_timeout).await?;
                 PoolKind::Elasticsearch(client)
             }
-            DatabaseType::Qdrant | DatabaseType::Milvus => {
+            DatabaseType::Qdrant | DatabaseType::Milvus | DatabaseType::Weaviate => {
                 let kind = match db_config.db_type {
                     DatabaseType::Qdrant => db::vector_driver::VectorDbKind::Qdrant,
                     DatabaseType::Milvus => db::vector_driver::VectorDbKind::Milvus,
+                    DatabaseType::Weaviate => db::vector_driver::VectorDbKind::Weaviate,
                     _ => unreachable!(),
                 };
                 let client = db::vector_driver::VectorClient::new(
@@ -1273,6 +1287,12 @@ impl AppState {
                     let timeout = crate::db::connection_timeout();
                     match agent.validate_connection(Some(timeout)).await {
                         Ok(_) => false,
+                        Err(err) if is_agent_validate_connection_unsupported(&err) => {
+                            log::debug!(
+                                "Agent connection pool '{pool_key}' does not support validate_connection; keeping pool"
+                            );
+                            false
+                        }
                         Err(err) => {
                             log::warn!("Agent connection pool '{pool_key}' is stale: {err}");
                             true
@@ -1863,6 +1883,7 @@ async fn ping_keepalive_target(target: &mut KeepaliveTarget, timeout: Duration) 
             };
             match client.validate_connection(Some(timeout)).await {
                 Ok(_) => Ok(()),
+                Err(err) if is_agent_validate_connection_unsupported(&err) => Ok(()),
                 Err(err) => {
                     client.kill();
                     Err(err)
@@ -1870,6 +1891,11 @@ async fn ping_keepalive_target(target: &mut KeepaliveTarget, timeout: Duration) 
             }
         }
     }
+}
+
+fn is_agent_validate_connection_unsupported(err: &str) -> bool {
+    let lower = err.to_ascii_lowercase();
+    lower.contains("validate_connection") && (lower.contains("unknown method") || lower.contains("method not found"))
 }
 
 fn connection_remote_endpoint(config: &ConnectionConfig) -> (String, u16) {
@@ -2112,7 +2138,10 @@ fn base_pool_key_for(
     let is_single_connection_pool = db_type.as_ref().is_some_and(|db_type| {
         let is_single = database_capabilities::is_single_connection_pool(db_type)
             || (include_elasticsearch_single_pool
-                && matches!(db_type, DatabaseType::Elasticsearch | DatabaseType::Qdrant | DatabaseType::Milvus));
+                && matches!(
+                    db_type,
+                    DatabaseType::Elasticsearch | DatabaseType::Qdrant | DatabaseType::Milvus | DatabaseType::Weaviate
+                ));
         is_single && (!database_capabilities::is_agent_type(db_type) || shares_database_pool_with_connection(db_type))
     });
 
@@ -2359,6 +2388,7 @@ mod tests {
             password: "secret".to_string(),
             database: database.map(str::to_string),
             visible_databases: None,
+            visible_schemas: None,
             attached_databases: Vec::new(),
             color: None,
             transport_layers: Vec::new(),
@@ -2464,6 +2494,7 @@ mod tests {
         assert!(uses_bare_mysql_pool(&DatabaseType::ManticoreSearch));
         assert!(!uses_bare_mysql_pool(&DatabaseType::Databend));
         assert!(database_capabilities::is_agent_type(&DatabaseType::Databend));
+        assert!(super::uses_agent_connection_pool(&DatabaseType::ZooKeeper));
     }
 
     #[test]
@@ -3286,6 +3317,18 @@ mod tests {
         assert!(!state.pool_activity.read().await.contains_key(pool_key));
 
         let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn agent_validate_connection_unknown_method_is_not_stale() {
+        assert!(super::is_agent_validate_connection_unsupported(
+            "Agent RPC error (-1): Unknown method: validate_connection"
+        ));
+        assert!(super::is_agent_validate_connection_unsupported(
+            "Agent RPC error (-32601): Method not found: validate_connection"
+        ));
+        assert!(!super::is_agent_validate_connection_unsupported("Agent RPC error (-1): Connection timed out"));
+        assert!(!super::is_agent_validate_connection_unsupported("Agent RPC error (-1): Unknown method: kv_put"));
     }
 
     #[cfg(feature = "duckdb-bundled")]

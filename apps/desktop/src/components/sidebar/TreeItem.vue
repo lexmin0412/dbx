@@ -83,11 +83,14 @@ import {
   buildDropDatabaseSql,
   buildDropObjectSql,
   buildDropSchemaSql,
+  buildGetSchemaCommentSql,
   buildDropTableSql,
   buildDropTableChildObjectSql,
   buildDuplicateTableStructureSql,
   buildEmptyTableSql,
+  buildSetSchemaCommentSql,
   buildTruncateTableSql,
+  supportsSchemaComment,
   type DropTableChildObjectSqlOptions,
   type DropObjectSqlOptions,
   type TableChildObjectType,
@@ -118,7 +121,9 @@ import { rankSavedSqlHistory, type SavedSqlHistoryScope } from "@/lib/savedSqlHi
 import { isSqlServerLinkedNode } from "@/lib/sqlServerLinkedServers";
 import DatabaseIcon from "@/components/icons/DatabaseIcon.vue";
 import ConnectionErrorIndicator from "@/components/connection/ConnectionErrorIndicator.vue";
+import { isSchemaAware } from "@/lib/databaseFeatureSupport";
 import VisibleDatabasesDialog from "@/components/sidebar/VisibleDatabasesDialog.vue";
+import SchemaFilterDialog from "@/components/sidebar/VisibleSchemasDialog.vue";
 import { Dialog, DialogContent, DialogHeader, DialogTitle, DialogFooter } from "@/components/ui/dialog";
 import { Button } from "@/components/ui/button";
 import { Badge } from "@/components/ui/badge";
@@ -150,6 +155,7 @@ type DuplicateStructureSource = TreeNode & { connectionId: string; database: str
 const DATA_TAB_METADATA_TTL_MS = 30_000;
 const { getDatabaseOptions } = useDatabaseOptions();
 const showVisibleDatabasesDialog = ref(false);
+const showVisibleSchemasDialog = ref(false);
 const { addTask: addExportTask } = useExportTracker();
 
 const props = defineProps<{
@@ -251,6 +257,8 @@ function getIconInfo(node: TreeNode): { icon: any; colorClass: string } | null {
       return { icon: FolderOpen, colorClass: "text-sky-500" };
     case "etcd-root":
       return { icon: Database, colorClass: "text-sky-500" };
+    case "zookeeper-root":
+      return { icon: Database, colorClass: "text-blue-500" };
     case "mongo-db":
       return { icon: Database, colorClass: "text-yellow-500" };
     case "mongo-collection":
@@ -347,6 +355,7 @@ function connectionTooltipScheme(config: Pick<ConnectionConfig, "db_type" | "ssl
     case "elasticsearch":
     case "qdrant":
     case "milvus":
+    case "weaviate":
     case "rqlite":
     case "turso":
     case "mq":
@@ -407,17 +416,18 @@ const connectionInfoTooltip = computed(() => {
   return { rows };
 });
 
-const tableInfoTooltip = computed(() => {
+const objectCommentTooltip = computed(() => {
   const node = props.node;
-  if (node.type !== "table" && node.type !== "view") return null;
+  const comment = node.type === "column" && node.meta && "comment" in node.meta ? (node.meta as ColumnInfo).comment : node.comment;
+  if (!comment || (node.type !== "schema" && node.type !== "table" && node.type !== "view" && node.type !== "column")) return null;
   const rows: DetailTooltipRow[] = [
-    { label: t("structureEditor.tableName"), value: visibleLabel(node) },
-    { label: t("structureEditor.comment"), value: cleanTooltipValue(node.comment), multiline: true },
+    { label: t("connection.name"), value: visibleLabel(node) },
+    { label: t("structureEditor.comment"), value: cleanTooltipValue(comment), multiline: true },
   ].filter((row) => row.value);
   return { rows };
 });
 
-const detailTooltip = computed(() => connectionInfoTooltip.value ?? tableInfoTooltip.value);
+const detailTooltip = computed(() => connectionInfoTooltip.value ?? objectCommentTooltip.value);
 
 function isTooltipDisabled(): boolean {
   if (detailTooltip.value?.rows.length) return isRenamingGroup.value;
@@ -466,11 +476,13 @@ async function toggle() {
         await connectionStore.loadRedisDatabases(node.connectionId);
       } else if (config?.db_type === "etcd") {
         await connectionStore.loadEtcdRoot(node.connectionId);
+      } else if (config?.db_type === "zookeeper") {
+        await connectionStore.loadZooKeeperRoot(node.connectionId);
       } else if (config?.db_type === "mongodb") {
         await connectionStore.loadMongoDatabases(node.connectionId);
       } else if (config?.db_type === "elasticsearch") {
         await connectionStore.loadElasticsearchIndices(node.connectionId);
-      } else if (config?.db_type === "qdrant" || config?.db_type === "milvus") {
+      } else if (config?.db_type === "qdrant" || config?.db_type === "milvus" || config?.db_type === "weaviate") {
         await connectionStore.loadVectorCollections(node.connectionId);
       } else if (config?.db_type === "mq") {
         await connectionStore.loadMqTenants(node.connectionId);
@@ -489,6 +501,11 @@ async function toggle() {
     } else if (node.type === "etcd-root" && node.connectionId) {
       const tabTitle = `${connectionStore.getConfig(node.connectionId)?.name || "etcd"}:keys`;
       queryStore.createTab(node.connectionId, "", tabTitle, "etcd");
+      refreshActiveKvBrowserAfterOpen("etcd", node.connectionId);
+    } else if (node.type === "zookeeper-root" && node.connectionId) {
+      const tabTitle = `${connectionStore.getConfig(node.connectionId)?.name || "ZooKeeper"}:keys`;
+      queryStore.createTab(node.connectionId, "", tabTitle, "zookeeper");
+      refreshActiveKvBrowserAfterOpen("zookeeper", node.connectionId);
     } else if (node.type === "user-admin" && node.connectionId) {
       queryStore.openUserAdmin(node.connectionId);
     } else if (node.type === "mongo-db" && node.connectionId && node.database) {
@@ -565,6 +582,12 @@ function runRowClickAction() {
   } else if (action === "toggle") {
     toggle();
   }
+}
+
+function refreshActiveKvBrowserAfterOpen(mode: "etcd" | "zookeeper", connectionId: string) {
+  void nextTick(() => {
+    window.dispatchEvent(new CustomEvent("dbx-refresh-active-kv-browser", { detail: { mode, connectionId } }));
+  });
 }
 
 async function loadMoreObjectGroupChildren() {
@@ -1421,6 +1444,9 @@ const showFlushRedisDbConfirm = ref(false);
 const showCreateSchemaDialog = ref(false);
 const createSchemaName = ref("");
 const showDropSchemaConfirm = ref(false);
+const showEditSchemaCommentDialog = ref(false);
+const schemaCommentText = ref("");
+const schemaCommentLoading = ref(false);
 
 // --- Procedure / Function Management ---
 const showDropObjectConfirm = ref(false);
@@ -1935,6 +1961,11 @@ const canDropSchema = computed(() => {
   return props.node.type === "schema" && !isSqlServerLinkedNode(props.node) && usesTreeSchemaMode(effectiveDatabaseTypeForConnection(config)) && !connectionUsesDatabaseObjectTreeMode(config);
 });
 
+const canEditSchemaComment = computed(() => {
+  const config = props.node.connectionId ? connectionStore.getConfig(props.node.connectionId) : undefined;
+  return props.node.type === "schema" && !!props.node.database && !config?.read_only && supportsSchemaComment(effectiveDatabaseTypeForConnection(config));
+});
+
 function tableAdminSqlOptions(): TableAdminSqlOptions {
   return {
     databaseType: currentDatabaseType(),
@@ -2036,6 +2067,75 @@ async function refreshDropSchemaPreviewSql() {
     databaseType: currentDatabaseType(),
     name: props.node.label,
   }).catch(() => "");
+}
+
+const schemaCommentPreviewSql = computed(() => {
+  if (!canEditSchemaComment.value) return "";
+  try {
+    return buildSetSchemaCommentSql({
+      databaseType: currentDatabaseType(),
+      name: props.node.schema || props.node.label,
+      comment: schemaCommentText.value,
+    });
+  } catch {
+    return "";
+  }
+});
+
+function schemaCommentFromResult(result: { columns?: string[]; rows?: unknown[] }): string {
+  const firstRow = result.rows?.[0];
+  if (Array.isArray(firstRow)) {
+    const index = Math.max(0, result.columns?.findIndex((column) => column === "comment") ?? 0);
+    return firstRow[index] == null ? "" : String(firstRow[index]);
+  }
+  if (firstRow && typeof firstRow === "object" && "comment" in firstRow) {
+    const value = (firstRow as { comment?: unknown }).comment;
+    return value == null ? "" : String(value);
+  }
+  return "";
+}
+
+async function openEditSchemaCommentDialog() {
+  const node = props.node;
+  if (!canEditSchemaComment.value || !node.connectionId || !node.database) return;
+  schemaCommentText.value = "";
+  schemaCommentLoading.value = true;
+  showEditSchemaCommentDialog.value = true;
+  try {
+    await connectionStore.ensureConnected(node.connectionId);
+    const sql = buildGetSchemaCommentSql({
+      databaseType: currentDatabaseType(),
+      name: node.schema || node.label,
+    });
+    const result = await api.executeQuery(node.connectionId, node.database, sql, node.schema, undefined, { maxRows: 1 });
+    schemaCommentText.value = schemaCommentFromResult(result);
+  } catch {
+    schemaCommentText.value = "";
+  } finally {
+    schemaCommentLoading.value = false;
+  }
+}
+
+async function confirmEditSchemaComment() {
+  const node = props.node;
+  if (!canEditSchemaComment.value || !node.connectionId || !node.database || schemaCommentLoading.value) return;
+  schemaCommentLoading.value = true;
+  try {
+    await connectionStore.ensureConnected(node.connectionId);
+    const sql = buildSetSchemaCommentSql({
+      databaseType: currentDatabaseType(),
+      name: node.schema || node.label,
+      comment: schemaCommentText.value,
+    });
+    await api.executeQuery(node.connectionId, node.database, sql, node.schema);
+    toast(t("contextMenu.editSchemaCommentSuccess", { name: node.label }), 3000);
+    showEditSchemaCommentDialog.value = false;
+    await connectionStore.loadSchemas(node.connectionId, node.database, { force: true });
+  } catch (e: any) {
+    toast(t("contextMenu.tableOperationFailed", { message: translateBackendError(t, e?.message || String(e)) }), 5000);
+  } finally {
+    schemaCommentLoading.value = false;
+  }
 }
 
 async function openCreateDatabase() {
@@ -2953,7 +3053,11 @@ const hasTypeMenu = computed(() => {
 });
 const columnComment = computed(() => (!settingsStore.editorSettings.sidebarHideTableComments && props.node.type === "column" && props.node.meta && "comment" in props.node.meta ? (props.node.meta as any).comment : null));
 const tableComment = computed(() =>
-  !settingsStore.editorSettings.sidebarHideTableComments && (props.node.type === "table" || props.node.type === "view" || props.node.type === "mongo-collection" || props.node.type === "vector-collection" || props.node.type === "elasticsearch-index") && props.node.comment ? props.node.comment : null,
+  !settingsStore.editorSettings.sidebarHideTableComments &&
+  (props.node.type === "schema" || props.node.type === "table" || props.node.type === "view" || props.node.type === "mongo-collection" || props.node.type === "vector-collection" || props.node.type === "elasticsearch-index") &&
+  props.node.comment
+    ? props.node.comment
+    : null,
 );
 const paddingLeft = computed(() => treeItemPaddingLeft(props.depth));
 const isConnected = computed(() => props.node.type === "connection" && !!props.node.connectionId && connectionStore.connectedIds.has(props.node.connectionId));
@@ -2964,11 +3068,25 @@ const nodeIconClass = computed(() => {
   if (props.node.type !== "database") return infoClass;
   return canCloseDatabaseConnection.value ? infoClass : "text-muted-foreground/65";
 });
+
 const canConfigureVisibleDatabases = computed(() => {
   if (props.node.type !== "connection" || !props.node.connectionId) return false;
   const dbType = connectionStore.getConfig(props.node.connectionId)?.db_type;
-  return dbType !== "elasticsearch" && dbType !== "qdrant" && dbType !== "milvus" && dbType !== "etcd" && dbType !== "mq" && dbType !== "nacos";
+  return dbType !== "elasticsearch" && dbType !== "qdrant" && dbType !== "milvus" && dbType !== "weaviate" && dbType !== "etcd" && dbType !== "mq" && dbType !== "nacos";
 });
+
+const canConfigureVisibleSchemas = computed(() => {
+  if (props.node.type === "database" && props.node.connectionId && props.node.database != null) {
+    const dbType = connectionStore.getConfig(props.node.connectionId)?.db_type;
+    return isSchemaAware(dbType);
+  }
+  if (props.node.type === "connection" && props.node.connectionId) {
+    const dbType = connectionStore.getConfig(props.node.connectionId)?.db_type;
+    return isSchemaAware(dbType) && !usesTreeSchemaMode(dbType);
+  }
+  return false;
+});
+
 const canCopyFinalProxyPort = computed(() => {
   if (props.node.type !== "connection" || !props.node.connectionId) return false;
   return hasEnabledTransportLayers(connectionStore.getConfig(props.node.connectionId));
@@ -3004,6 +3122,10 @@ function togglePin() {
 
 function openVisibleDatabasesDialog() {
   showVisibleDatabasesDialog.value = true;
+}
+
+function openVisibleSchemasDialog() {
+  showVisibleSchemasDialog.value = true;
 }
 
 // --- Connection Group Management ---
@@ -3420,6 +3542,13 @@ function treeItemMenuItems(): ContextMenuItem[] {
         icon: ListFilter,
       });
     }
+    if (canConfigureVisibleSchemas.value) {
+      items.push({
+        label: t("visibleSchemas.title"),
+        action: openVisibleSchemasDialog,
+        icon: ListFilter,
+      });
+    }
     items.push({ label: t("contextMenu.editConnection"), action: editConnection, icon: Pencil });
     if (revealConnectionFilePath.value) {
       items.push({
@@ -3494,6 +3623,9 @@ function treeItemMenuItems(): ContextMenuItem[] {
     if (canCreateSchema.value) {
       items.push({ label: t("contextMenu.createSchema"), action: openCreateSchemaDialog, icon: Plus });
     }
+    if (canEditSchemaComment.value) {
+      items.push({ label: t("contextMenu.editSchemaComment"), action: openEditSchemaCommentDialog, icon: SquarePen });
+    }
     if (canOpenSqlFileExecution.value) {
       items.push({ label: t("sqlFile.title"), action: openSqlFileExecution, icon: FileCode });
     }
@@ -3509,6 +3641,13 @@ function treeItemMenuItems(): ContextMenuItem[] {
       icon: RefreshCw,
       shortcut: shortcutRefresh,
     });
+    if (canConfigureVisibleSchemas.value) {
+      items.push({
+        label: t("visibleSchemas.title"),
+        action: openVisibleSchemasDialog,
+        icon: ListFilter,
+      });
+    }
     items.push({ label: "", separator: true });
     items.push({ label: t("transfer.dataTransfer"), action: openTransfer, icon: ArrowRightLeft });
     items.push({ label: t("diff.title"), action: openSchemaDiff, icon: ArrowRightLeft });
@@ -3543,7 +3682,7 @@ function treeItemMenuItems(): ContextMenuItem[] {
   }
 
   // 5. Redis DB / Mongo DB
-  if (node.type === "etcd-root") {
+  if (node.type === "etcd-root" || node.type === "zookeeper-root") {
     items.push({ label: t("contextMenu.openConnection"), action: toggle, icon: Database });
     return items;
   }
@@ -3917,7 +4056,12 @@ function treeItemMenuItems(): ContextMenuItem[] {
       </LightTooltip>
     </div>
   </CustomContextMenu>
+
   <VisibleDatabasesDialog v-if="node.type === 'connection' && node.connectionId" v-model:open="showVisibleDatabasesDialog" :connection-id="node.connectionId" :connection-name="node.label" />
+
+  <SchemaFilterDialog v-if="node.type === 'database' && node.connectionId && node.database != null" v-model:open="showVisibleSchemasDialog" :connection-id="node.connectionId" :connection-name="node.label" :database="node.database ?? ''" />
+
+  <SchemaFilterDialog v-else-if="node.type === 'connection' && node.connectionId && canConfigureVisibleSchemas" v-model:open="showVisibleSchemasDialog" :connection-id="node.connectionId" :connection-name="node.label" :database="connectionStore.getConfig(node.connectionId)?.database || ''" />
 
   <Dialog v-model:open="showDeleteConfirm">
     <DialogContent class="sm:max-w-[400px]">
@@ -4220,6 +4364,31 @@ function treeItemMenuItems(): ContextMenuItem[] {
       <DialogFooter>
         <Button variant="outline" @click="showCreateSchemaDialog = false">{{ t("dangerDialog.cancel") }}</Button>
         <Button :disabled="!createSchemaName.trim()" @click="confirmCreateSchema">{{ t("dangerDialog.confirm") }}</Button>
+      </DialogFooter>
+    </DialogContent>
+  </Dialog>
+
+  <Dialog v-model:open="showEditSchemaCommentDialog">
+    <DialogContent class="sm:max-w-[520px]">
+      <DialogHeader>
+        <DialogTitle>{{ t("contextMenu.editSchemaCommentTitle", { name: node.label }) }}</DialogTitle>
+      </DialogHeader>
+      <div class="grid gap-3">
+        <textarea
+          v-model="schemaCommentText"
+          class="min-h-28 w-full resize-y rounded-md border border-input bg-background px-3 py-2 text-sm outline-none transition-colors focus:border-ring focus:ring-1 focus:ring-ring/40"
+          :placeholder="t('contextMenu.schemaCommentPlaceholder')"
+          :disabled="schemaCommentLoading"
+          @keydown.meta.enter.prevent="confirmEditSchemaComment"
+          @keydown.ctrl.enter.prevent="confirmEditSchemaComment"
+        ></textarea>
+        <pre v-if="schemaCommentPreviewSql" class="max-h-32 overflow-auto rounded bg-muted p-3 text-xs whitespace-pre-wrap" v-html="highlight(schemaCommentPreviewSql)"></pre>
+      </div>
+      <DialogFooter>
+        <Button variant="outline" :disabled="schemaCommentLoading" @click="showEditSchemaCommentDialog = false">{{ t("dangerDialog.cancel") }}</Button>
+        <Button :disabled="schemaCommentLoading" @click="confirmEditSchemaComment">
+          {{ schemaCommentLoading ? t("contextMenu.schemaCommentSaving") : t("dangerDialog.confirm") }}
+        </Button>
       </DialogFooter>
     </DialogContent>
   </Dialog>
