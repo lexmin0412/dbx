@@ -1,5 +1,5 @@
 <script setup lang="ts">
-import { ref, computed, nextTick, watch, provide, onMounted, onUnmounted, type Component } from "vue";
+import { ref, computed, nextTick, watch, provide, onMounted, onUnmounted, type Component, type CSSProperties } from "vue";
 import { useI18n } from "vue-i18n";
 import { Search, X, ListFilter, Crosshair, Server, Database, FolderTree, Table2, Eye, RotateCcw } from "@lucide/vue";
 import { useConnectionStore } from "@/stores/connectionStore";
@@ -33,7 +33,7 @@ const plainTreeScrollerRef = ref<HTMLElement | null>(null);
 type SearchScope = "connection" | "database" | "schema" | "table" | "view";
 const selectedSearchScopes = ref<SearchScope[]>([]);
 const searchCollapsedIds = ref<Set<string>>(new Set());
-const searchRefreshedGroupIds = new Set<string>();
+const searchRefreshedNodeIds = new Set<string>();
 let searchTimer: number | undefined;
 
 watch(
@@ -58,30 +58,50 @@ watch(deferredSearchQuery, (newQuery, oldQuery) => {
   store.sidebarSearchQuery = newQuery;
   const tasks: Promise<void>[] = [];
   for (const root of store.treeNodes) {
-    collectExpandedObjectGroups(root, tasks, newQuery ? searchRefreshedGroupIds : undefined);
+    collectExpandedObjectSearchTargets(root, tasks, newQuery ? searchRefreshedNodeIds : undefined);
   }
   if (!newQuery && oldQuery) {
-    searchRefreshedGroupIds.clear();
+    searchRefreshedNodeIds.clear();
   }
   Promise.all(tasks).catch(() => {});
 });
 
 const searchableObjectGroupTypes = new Set<TreeNodeType>(["group-tables", "group-views", "group-materialized-views"]);
+const simpleObjectParentTypes = new Set<TreeNodeType>(["database", "schema", "linked-server-schema"]);
+const simpleObjectChildTypes = new Set<TreeNodeType>(["table", "view", "materialized_view", "procedure", "function", "sequence", "package", "package-body", "load-more"]);
 
-function collectExpandedObjectGroups(node: TreeNode, tasks: Promise<void>[], refreshedGroupIds?: Set<string>) {
-  if (refreshedGroupIds && node.isExpanded && node.children) {
+function isSimpleObjectSearchParent(node: TreeNode): boolean {
+  return (
+    settingsStore.editorSettings.sidebarObjectDisplay === "simple" &&
+    simpleObjectParentTypes.has(node.type) &&
+    node.isExpanded === true &&
+    !!node.children?.some((child) => simpleObjectChildTypes.has(child.type))
+  );
+}
+
+function collectExpandedObjectSearchTargets(node: TreeNode, tasks: Promise<void>[], refreshedNodeIds?: Set<string>) {
+  if (refreshedNodeIds && isSimpleObjectSearchParent(node)) {
+    refreshedNodeIds.add(node.id);
+    tasks.push(store.refreshTreeNode(node));
+    return;
+  }
+  if (refreshedNodeIds && node.isExpanded && node.children) {
     for (const child of node.children) {
       if (child.connectionId && searchableObjectGroupTypes.has(child.type)) {
-        refreshedGroupIds.add(child.id);
+        refreshedNodeIds.add(child.id);
         tasks.push(store.loadObjectGroupChildren(child, { force: true }));
       }
     }
-  } else if (!refreshedGroupIds && searchRefreshedGroupIds.has(node.id)) {
-    tasks.push(store.loadObjectGroupChildren(node, { force: true }));
+  } else if (!refreshedNodeIds && searchRefreshedNodeIds.has(node.id)) {
+    if (searchableObjectGroupTypes.has(node.type)) {
+      tasks.push(store.loadObjectGroupChildren(node, { force: true }));
+    } else if (simpleObjectParentTypes.has(node.type)) {
+      tasks.push(store.refreshTreeNode(node));
+    }
   }
   if (node.children) {
     for (const child of node.children) {
-      collectExpandedObjectGroups(child, tasks, refreshedGroupIds);
+      collectExpandedObjectSearchTargets(child, tasks, refreshedNodeIds);
     }
   }
 }
@@ -218,14 +238,30 @@ const stickyNode = computed<FlatTreeNode | null>(() => {
 
   const topIndex = Math.min(Math.floor(stickyScrollTop.value / SIDEBAR_TREE_ROW_HEIGHT), len - 1);
   // Walk UP from the topmost visible row to the nearest database-level ancestor.
-  // If the topmost row is itself a database node (it hasn't scrolled past the
-  // viewport yet), return null so the overlay doesn't duplicate the real row.
+  // Show the overlay as soon as that database row starts crossing the top edge,
+  // instead of waiting for it to fully scroll out by one row.
   for (let i = topIndex; i >= 0; i--) {
     const item = nodes[i];
     if (!DATABASE_LEVEL_TYPES.has(item.type)) continue;
-    return i === topIndex ? null : item;
+    const rowTop = i * SIDEBAR_TREE_ROW_HEIGHT;
+    return stickyScrollTop.value > rowTop ? item : null;
   }
   return null;
+});
+
+const stickyHeaderStyle = computed<CSSProperties>(() => {
+  const node = stickyNode.value;
+  if (!node) return {};
+  const nodes = flatNodes.value;
+  const currentIndex = nodes.findIndex((item) => item.id === node.id);
+  if (currentIndex < 0) return {};
+  const nextDatabaseIndex = nodes.findIndex((item, index) => index > currentIndex && DATABASE_LEVEL_TYPES.has(item.type));
+  if (nextDatabaseIndex < 0) return {};
+  const distanceToNext = nextDatabaseIndex * SIDEBAR_TREE_ROW_HEIGHT - stickyScrollTop.value;
+  if (distanceToNext >= SIDEBAR_TREE_ROW_HEIGHT) return {};
+  return {
+    transform: `translateY(${Math.min(0, distanceToNext - SIDEBAR_TREE_ROW_HEIGHT)}px)`,
+  };
 });
 
 // Reset tracking when the tree rebuilds (connect/disconnect/collapse) so a
@@ -657,28 +693,29 @@ defineExpose({ focusSearch, createNewGroup });
         />
       </div>
     </div>
-    <div v-if="stickyNode" class="sticky-database-header relative z-[5] border-b border-border/60">
-      <TreeItem :node="stickyNode.node" :depth="stickyNode.depth" :drag-disabled="true" @search-toggle="onSearchToggle" />
+    <div v-if="flatNodes.length > 0 && useVirtualTree" class="connection-tree-scroll-shell relative min-h-0 flex-1">
+      <RecycleScroller
+        ref="treeScrollerRef"
+        class="sidebar-tree connection-tree-scroller h-full overflow-y-auto"
+        :class="sidebarTreeOverflowClass"
+        @click="clearSidebarSelection"
+        :items="flatNodes"
+        :item-size="SIDEBAR_TREE_ROW_HEIGHT"
+        :buffer="SIDEBAR_TREE_SCROLL_BUFFER"
+        :prerender="SIDEBAR_TREE_PRERENDER_COUNT"
+        :skip-hover="true"
+        key-field="id"
+        type-field="type"
+        flow-mode
+      >
+        <template #default="{ item }">
+          <TreeItem :node="item.node" :depth="item.depth" :drag-disabled="isFiltering" :pending-rename="pendingRenameGroupId === item.node.id" :highlighted="highlightedNodeId === item.node.id" @search-toggle="onSearchToggle" @rename-started="pendingRenameGroupId = null" />
+        </template>
+      </RecycleScroller>
+      <div v-if="stickyNode" class="sticky-database-header pointer-events-auto absolute inset-x-0 top-0 z-[5] border-b border-border/60" :style="stickyHeaderStyle">
+        <TreeItem :node="stickyNode.node" :depth="stickyNode.depth" :drag-disabled="true" @search-toggle="onSearchToggle" />
+      </div>
     </div>
-    <RecycleScroller
-      v-if="flatNodes.length > 0 && useVirtualTree"
-      ref="treeScrollerRef"
-      class="sidebar-tree connection-tree-scroller min-h-0 flex-1 overflow-y-auto"
-      :class="sidebarTreeOverflowClass"
-      @click="clearSidebarSelection"
-      :items="flatNodes"
-      :item-size="SIDEBAR_TREE_ROW_HEIGHT"
-      :buffer="SIDEBAR_TREE_SCROLL_BUFFER"
-      :prerender="SIDEBAR_TREE_PRERENDER_COUNT"
-      :skip-hover="true"
-      key-field="id"
-      type-field="type"
-      flow-mode
-    >
-      <template #default="{ item }">
-        <TreeItem :node="item.node" :depth="item.depth" :drag-disabled="isFiltering" :pending-rename="pendingRenameGroupId === item.node.id" :highlighted="highlightedNodeId === item.node.id" @search-toggle="onSearchToggle" @rename-started="pendingRenameGroupId = null" />
-      </template>
-    </RecycleScroller>
     <div v-else-if="flatNodes.length > 0" ref="plainTreeScrollerRef" class="sidebar-tree min-h-0 flex-1 overflow-y-auto" :class="sidebarTreeOverflowClass" @click="clearSidebarSelection">
       <TreeItem
         v-for="item in flatNodes"

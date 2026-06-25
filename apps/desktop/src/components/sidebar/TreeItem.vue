@@ -66,7 +66,7 @@ import type { ColumnInfo, ConnectionConfig, DatabaseType, TreeNode, TreeNodeType
 import * as api from "@/lib/api";
 import { uuid } from "@/lib/utils";
 import { resolveDefaultDatabase } from "@/lib/defaultDatabase";
-import { canTreeNodeShowExpander, treeItemPaddingLeft, usesFullWidthTreeLabel } from "@/lib/sidebarTreeItemLayout";
+import { canTreeNodePin, canTreeNodeShowExpander, treeItemPaddingLeft, usesFullWidthTreeLabel } from "@/lib/sidebarTreeItemLayout";
 import { buildTableSelectSql } from "@/lib/tableSelectSql";
 import { buildTableDeleteTemplate, buildTableInsertTemplate, buildTableSelectTemplate, buildTableUpdateTemplate } from "@/lib/tableSqlTemplates";
 import { connectionFilePath, defaultSqliteBackupFileName, isMemorySqlitePath, sqliteBackupSourcePath } from "@/lib/connectionFile";
@@ -302,8 +302,6 @@ function getIconInfo(node: TreeNode): { icon: any; colorClass: string } | null {
 }
 
 const groupTypes: Set<TreeNodeType> = new Set(["group-columns", "group-indexes", "group-fkeys", "group-triggers", "group-tables", "group-views", "group-materialized-views", "group-procedures", "group-functions", "group-sequences", "group-packages", "group-partitions"]);
-const pinnableTypes: Set<TreeNodeType> = new Set(["connection-group", "database", "linked-server", "linked-server-catalog", "linked-server-schema", "schema", "table", "view", "materialized_view", "redis-db", "mongo-db", "mongo-collection", "vector-collection", "elasticsearch-index"]);
-
 function isGroupLabel(node: TreeNode): boolean {
   return groupTypes.has(node.type);
 }
@@ -906,7 +904,7 @@ async function openData() {
     dbType: config?.db_type,
   });
   const tableSchema = connectionObjectTreeNodeSchema(config, node.database, node.schema);
-  const tableType = node.type === "view" ? "VIEW" : node.type === "materialized_view" ? "MATERIALIZED_VIEW" : "TABLE";
+  const tableType = node.type === "view" ? "VIEW" : node.type === "materialized_view" ? "MATERIALIZED_VIEW" : (node.tableType ?? "TABLE");
   const isSameDataTableTab = (tab: (typeof queryStore.tabs)[number]) => tab.mode === "data" && tab.connectionId === node.connectionId && tab.database === node.database && (tab.schema || "") === (tableSchema || "") && (tab.tableMeta?.tableName || tab.title) === node.label;
   const activateExistingSameTableTab = () => {
     const existing = queryStore.tabs.find(isSameDataTableTab);
@@ -1074,6 +1072,7 @@ async function openData() {
       databaseType: effectiveDbType,
       schema: tableSchema,
       tableName: node.label,
+      tableType,
       columns: columns.map((column) => column.name),
       primaryKeys,
       limit,
@@ -2721,6 +2720,7 @@ async function exportDataLegacy(format: "csv" | "json" | "sql") {
       databaseType: effectiveDbType,
       schema: node.schema,
       tableName: node.label,
+      tableType: node.tableType,
       columns: queryColumns,
       executePage: (sql) => api.executeQuery(connectionId, database, sql),
     });
@@ -2817,6 +2817,7 @@ async function exportTableData(format: "csv" | "xlsx") {
     const queryColumns = config.db_type === "neo4j" ? (await api.getColumns(connectionId, database, node.schema || database, node.label)).map((c) => c.name) : undefined;
 
     // Step 4: Start streaming export (background, non-blocking)
+    const rowLimit = settingsStore.editorSettings.exportRowLimitEnabled ? settingsStore.editorSettings.exportRowLimit : null;
     const request: api.TableExportRequest = {
       exportId: currentTask.exportId,
       connectionId,
@@ -2827,6 +2828,7 @@ async function exportTableData(format: "csv" | "xlsx") {
       format,
       columns: queryColumns,
       batchSize: settingsStore.editorSettings.exportBatchSize,
+      rowLimit,
     };
 
     await api.startTableExport(request, (progress) => {
@@ -3046,7 +3048,7 @@ const canExpand = computed(() =>
     childCount: props.node.children?.length ?? 0,
   }),
 );
-const canPin = computed(() => pinnableTypes.has(props.node.type));
+const canPin = computed(() => canTreeNodePin(props.node.type));
 const canOpenSqlFileExecution = computed(() => {
   return supportsSqlFileExecution(rawDatabaseType());
 });
@@ -4053,15 +4055,7 @@ function treeItemMenuItems(): ContextMenuItem[] {
           <span v-if="node.type === 'connection' && node.connectionId && connectionStore.connectedIds.has(node.connectionId)" class="w-1.5 h-1.5 rounded-full bg-green-500 shrink-0" />
           <Badge v-if="isConnectionReadonly" variant="secondary" class="h-4 px-1.5 text-[10px] gap-0.5"><Lock class="w-2.5 h-2.5" />{{ t("connection.readOnlyBadge") }}</Badge>
           <ConnectionErrorIndicator v-if="node.type === 'connection'" :connection-id="node.connectionId" trigger-class="h-4 w-4" />
-          <button
-            v-if="canPin"
-            class="rounded p-0.5 text-muted-foreground hover:bg-muted-foreground/15 hover:text-foreground focus:opacity-100"
-            :class="isPinned ? 'opacity-100 text-primary' : 'opacity-0 group-hover:opacity-100'"
-            :title="isPinned ? t('contextMenu.unpin') : t('contextMenu.pin')"
-            @click.stop="togglePin"
-          >
-            <Pin class="w-3 h-3" :class="{ 'fill-current': isPinned }" />
-          </button>
+          <Pin v-if="isPinned" class="w-3 h-3 shrink-0 text-primary fill-current" aria-hidden="true" />
         </div>
         <template v-if="detailTooltip" #content>
           <div class="w-max min-w-40 max-w-[min(28rem,calc(100vw-24px))] rounded-md border border-border bg-popover p-2 text-popover-foreground shadow-lg">
