@@ -1054,8 +1054,8 @@ async function exportDebugLogs() {
 const mcpStatus = ref<McpServerStatus | null>(null);
 const mcpStatusLoading = ref(false);
 const mcpStatusError = ref("");
-const mcpCopied = ref<"" | "install" | "claude-config" | "codex-config">("");
-const mcpConfigTab = ref<"claude" | "codex">("claude");
+const mcpCopied = ref<"" | "install" | "claude-config" | "codex-config" | "opencode-config">("");
+const mcpConfigTab = ref<"claude" | "codex" | "opencode">("claude");
 const mcpReadonlyMode = ref(false);
 const mcpAllowDangerous = ref(false);
 const mcpInstalling = ref(false);
@@ -1100,6 +1100,22 @@ const mcpCodexRecommendedConfig = computed(() => {
   return lines.join("\n");
 });
 
+const mcpOpenCodeRecommendedConfig = computed(() => {
+  const config: Record<string, unknown> = {
+    mcp: {
+      dbx: {
+        type: "local",
+        command: ["dbx-mcp-server"],
+      } as Record<string, unknown>,
+    },
+  };
+  if (mcpEnvEntries.value.length > 0) {
+    const env = Object.fromEntries(mcpEnvEntries.value);
+    ((config.mcp as Record<string, unknown>).dbx as Record<string, unknown>).environment = env;
+  }
+  return JSON.stringify(config, null, 2);
+});
+
 const mcpStatusTone = computed<"ok" | "warning" | "muted">(() => {
   if (!mcpStatus.value) return "muted";
   if (!mcpStatus.value.installed || mcpStatus.value.update_available || mcpStatus.value.error) return "warning";
@@ -1137,7 +1153,7 @@ async function refreshMcpStatus() {
   }
 }
 
-async function copyMcpText(kind: "install" | "claude-config" | "codex-config", value: string) {
+async function copyMcpText(kind: "install" | "claude-config" | "codex-config" | "opencode-config", value: string) {
   mcpCopied.value = kind;
   try {
     await copyToClipboard(value);
@@ -3254,6 +3270,7 @@ watch(
                   <TabsList>
                     <TabsTrigger value="claude">Claude Code</TabsTrigger>
                     <TabsTrigger value="codex">Codex</TabsTrigger>
+                    <TabsTrigger value="opencode">OpenCode</TabsTrigger>
                   </TabsList>
 
                   <TabsContent value="claude" class="m-0">
@@ -3275,6 +3292,21 @@ watch(
                         <pre class="overflow-x-auto whitespace-pre text-xs leading-relaxed"><code>{{ mcpCodexRecommendedConfig }}</code></pre>
                         <Button type="button" variant="outline" size="icon" class="absolute right-2 top-2 h-7 w-7" :title="t('common.copy')" @click="copyMcpText('codex-config', mcpCodexRecommendedConfig)">
                           <CheckCircle2 v-if="mcpCopied === 'codex-config'" class="h-3.5 w-3.5 text-green-500" />
+                          <Copy v-else class="h-3.5 w-3.5" />
+                        </Button>
+                      </div>
+                    </div>
+                  </TabsContent>
+
+                  <TabsContent value="opencode" class="m-0">
+                    <div class="space-y-2">
+                      <div class="rounded-md border bg-muted/20 px-3 py-2 text-xs text-muted-foreground">
+                        {{ t("settings.mcpOpenCodeConfigPath") }}
+                      </div>
+                      <div class="relative rounded-md border bg-background p-3">
+                        <pre class="overflow-x-auto whitespace-pre text-xs leading-relaxed"><code>{{ mcpOpenCodeRecommendedConfig }}</code></pre>
+                        <Button type="button" variant="outline" size="icon" class="absolute right-2 top-2 h-7 w-7" :title="t('common.copy')" @click="copyMcpText('opencode-config', mcpOpenCodeRecommendedConfig)">
+                          <CheckCircle2 v-if="mcpCopied === 'opencode-config'" class="h-3.5 w-3.5 text-green-500" />
                           <Copy v-else class="h-3.5 w-3.5" />
                         </Button>
                       </div>
