@@ -10,6 +10,7 @@ import {
   Eye,
   ChevronRight,
   ChevronDown,
+  ChevronsDown,
   Loader2,
   FolderOpen,
   FolderClosed,
@@ -355,6 +356,7 @@ function connectionTooltipScheme(config: Pick<ConnectionConfig, "db_type" | "ssl
     case "qdrant":
     case "milvus":
     case "weaviate":
+    case "chromadb":
     case "rqlite":
     case "turso":
     case "mq":
@@ -481,7 +483,7 @@ async function toggle() {
         await connectionStore.loadMongoDatabases(node.connectionId);
       } else if (config?.db_type === "elasticsearch") {
         await connectionStore.loadElasticsearchIndices(node.connectionId);
-      } else if (config?.db_type === "qdrant" || config?.db_type === "milvus" || config?.db_type === "weaviate") {
+      } else if (config?.db_type === "qdrant" || config?.db_type === "milvus" || config?.db_type === "weaviate" || config?.db_type === "chromadb") {
         await connectionStore.loadVectorCollections(node.connectionId);
       } else if (config?.db_type === "mq") {
         await connectionStore.loadMqTenants(node.connectionId);
@@ -515,8 +517,9 @@ async function toggle() {
       const tab = queryStore.createTab(node.connectionId, node.database || "default", node.label, "mongo");
       queryStore.updateSql(tab, node.label);
     } else if (node.type === "vector-collection" && node.connectionId) {
+      const collectionRef = node.id.includes("__vector_collection:") ? node.id.split("__vector_collection:").pop() || node.label : node.label;
       const tab = queryStore.createTab(node.connectionId, node.database || "default", node.label, "vector");
-      queryStore.updateSql(tab, node.label);
+      queryStore.updateSql(tab, collectionRef);
     } else if (node.type === "database" && node.connectionId && hasTreeNodeDatabaseContext(node)) {
       const config = connectionStore.getConfig(node.connectionId);
       const effectiveDbType = effectiveDatabaseTypeForConnection(config);
@@ -592,6 +595,14 @@ function refreshActiveKvBrowserAfterOpen(mode: "etcd" | "zookeeper", connectionI
 async function loadMoreObjectGroupChildren() {
   try {
     await connectionStore.loadMoreObjectGroupChildren(props.node);
+  } catch (e: any) {
+    toast(t("connection.connectFailed", { message: translateBackendError(t, e?.message || String(e)) }), 5000);
+  }
+}
+
+async function loadAllObjectGroupChildren() {
+  try {
+    await connectionStore.loadAllObjectGroupChildren(props.node);
   } catch (e: any) {
     toast(t("connection.connectFailed", { message: translateBackendError(t, e?.message || String(e)) }), 5000);
   }
@@ -3098,7 +3109,7 @@ const nodeIconClass = computed(() => {
 const canConfigureVisibleDatabases = computed(() => {
   if (props.node.type !== "connection" || !props.node.connectionId) return false;
   const dbType = connectionStore.getConfig(props.node.connectionId)?.db_type;
-  return dbType !== "elasticsearch" && dbType !== "qdrant" && dbType !== "milvus" && dbType !== "weaviate" && dbType !== "etcd" && dbType !== "mq" && dbType !== "nacos";
+  return dbType !== "elasticsearch" && dbType !== "qdrant" && dbType !== "milvus" && dbType !== "weaviate" && dbType !== "chromadb" && dbType !== "etcd" && dbType !== "mq" && dbType !== "nacos";
 });
 
 const canConfigureVisibleSchemas = computed(() => {
@@ -3956,6 +3967,7 @@ function treeItemMenuItems(): ContextMenuItem[] {
   // 9. Group Labels (group-columns, group-tables, etc.)
   if (isGroupLabel(node)) {
     const hasGroupCreateAction = (node.type === "group-tables" && canCreateTable.value) || (node.type === "group-views" && !!node.connectionId && !!node.database);
+    const canLoadAllObjectGroup = node.type === "group-tables" || node.type === "group-views" || node.type === "group-materialized-views";
     if (node.type === "group-tables" && canCreateTable.value) {
       items.push({ label: t("contextMenu.createTable"), action: createTable, icon: Plus });
     }
@@ -3964,6 +3976,14 @@ function treeItemMenuItems(): ContextMenuItem[] {
     }
     if (hasGroupCreateAction) {
       items.push({ label: "", separator: true });
+    }
+    if (canLoadAllObjectGroup) {
+      items.push({
+        label: t("contextMenu.expandAll"),
+        action: loadAllObjectGroupChildren,
+        icon: ChevronsDown,
+        disabled: node.isLoading,
+      });
     }
     if (node.type !== "group-partitions") {
       items.push({

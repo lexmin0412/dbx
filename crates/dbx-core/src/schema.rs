@@ -714,6 +714,9 @@ async fn list_schemas_once(
     let pool = connections.get(&pool_key).ok_or("Pool not found")?;
 
     match pool {
+        PoolKind::Mysql(p, mode) if *mode == MysqlMode::OceanBaseOracle => db::ob_oracle::list_schemas(p)
+            .await
+            .map(|schemas| filter_visible_schema_names(schemas, visible_schema_filter.as_deref())),
         PoolKind::Postgres(p) => db::postgres::list_schemas(p)
             .await
             .map(|schemas| filter_visible_schema_names(schemas, visible_schema_filter.as_deref())),
@@ -1057,7 +1060,7 @@ async fn list_tables_once(
             .map(|tables| filter_table_infos(tables, filter, limit, offset, object_types)),
         PoolKind::VectorDb(client) => db::vector_driver::list_collections(client)
             .await
-            .map(|names| collection_names_to_tables(names, "COLLECTION"))
+            .map(|infos| collection_names_to_tables(infos.into_iter().map(|i| i.name).collect(), "COLLECTION"))
             .map(|tables| filter_table_infos(tables, filter, limit, offset, object_types)),
         _ => Ok(vec![]),
     }
@@ -1986,6 +1989,9 @@ async fn list_object_statistics_once(
         }
         PoolKind::Postgres(p) if db_config.as_ref().is_some_and(is_questdb_config) => Ok(vec![]),
         PoolKind::Postgres(p) => db::postgres::list_object_statistics(p, schema).await,
+        PoolKind::ClickHouse(client) => {
+            db::clickhouse_driver::list_object_statistics(client, clickhouse_metadata_database(database, schema)).await
+        }
         _ => Ok(vec![]),
     }
 }

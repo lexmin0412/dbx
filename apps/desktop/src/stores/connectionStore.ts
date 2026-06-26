@@ -28,7 +28,7 @@ import { buildSqlServerDatabaseTreeNodes } from "@/lib/sqlServerTree";
 import { findDatabaseTreeNode } from "@/lib/treeRefreshTarget";
 import { shouldMarkDisconnected } from "@/lib/connectionHealth";
 import { connectionAttemptOriginalErrorMessage, connectionAttemptTimeoutMessage, connectionAttemptTimeoutMs } from "@/lib/connectionAttemptTimeout";
-import { filterDatabaseNamesForConnection, filterSchemaNamesForConnection, filterVisibleDatabaseNames, normalizeVisibleDatabaseSelection } from "@/lib/visibleDatabases";
+import { connectionUsesVisibleSchemaFilter, filterDatabaseNamesForConnection, filterSchemaNamesForConnection, filterVisibleDatabaseNames, normalizeVisibleDatabaseSelection } from "@/lib/visibleDatabases";
 import {
   buildObjectGroupPlaceholderNodes,
   buildGroupedObjectTreeNodes,
@@ -410,6 +410,7 @@ export const useConnectionStore = defineStore("connection", () => {
       qdrant: "Qdrant",
       milvus: "Milvus",
       weaviate: "Weaviate",
+      chromadb: "ChromaDB",
       doris: "Doris",
       starrocks: "StarRocks",
       manticoresearch: "Manticore Search",
@@ -1061,7 +1062,7 @@ export const useConnectionStore = defineStore("connection", () => {
       await loadMongoDatabases(connectionId);
     } else if (config.db_type === "elasticsearch") {
       await loadElasticsearchIndices(connectionId);
-    } else if (config.db_type === "qdrant" || config.db_type === "milvus" || config.db_type === "weaviate") {
+    } else if (config.db_type === "qdrant" || config.db_type === "milvus" || config.db_type === "weaviate" || config.db_type === "chromadb") {
       await loadVectorCollections(connectionId);
     } else if (config.db_type === "mq") {
       await loadMqTenants(connectionId, { force: true });
@@ -1234,8 +1235,9 @@ export const useConnectionStore = defineStore("connection", () => {
         const children = withSavedSqlRoot(connectionId, buildDuckDbConnectionTreeNodes(connectionId, databases, schemas), node);
         setChildren(node, children);
         await savePersistedTreeChildren(cacheKey, children);
-      } else if (config?.db_type === "dameng" || config?.db_type === "oracle") {
-        const effectiveDb = config.database || "";
+      } else if (config && connectionUsesVisibleSchemaFilter(config)) {
+        const schemaFilterConfig = config;
+        const effectiveDb = schemaFilterConfig.database || "";
         const cacheKey = schemaCacheKey(connectionId, effectiveDb, "schemas");
         if (!options?.force) {
           const cached = await loadPersistedTreeChildren(node, cacheKey);
@@ -1245,7 +1247,7 @@ export const useConnectionStore = defineStore("connection", () => {
           }
         }
         const schemas = await withMetadataLoadTimeout(connectionId, api.listSchemas(connectionId, effectiveDb, true), "schemas");
-        const visibleSchemas = filterSchemaNamesForConnection(schemas, config, effectiveDb || "");
+        const visibleSchemas = filterSchemaNamesForConnection(schemas, schemaFilterConfig, effectiveDb || "");
         const schemaNodes: TreeNode[] = sortSidebarNames(visibleSchemas).map((s) => ({
           id: `${connectionId}:${s}:${s}`,
           label: s,
@@ -1596,17 +1598,19 @@ export const useConnectionStore = defineStore("connection", () => {
     try {
       await ensureConnected(connectionId);
       const collections = await withMetadataLoadTimeout(connectionId, api.vectorListCollections(connectionId), "vector collections");
+      const sorted = [...collections].sort((a, b) => a.name.localeCompare(b.name));
       setChildren(
         node,
         withSavedSqlRoot(
           connectionId,
-          sortSidebarNames(collections).map((collection) => ({
-            id: `${connectionId}:__vector_collection:${collection}`,
-            label: collection,
+          sorted.map((info) => ({
+            id: `${connectionId}:__vector_collection:${info.id}`,
+            label: info.name,
             type: "vector-collection" as const,
             connectionId,
             database: "default",
             isExpanded: false,
+            meta: info.dimension != null ? { dimension: info.dimension } : undefined,
           })),
           node,
         ),
@@ -1628,9 +1632,10 @@ export const useConnectionStore = defineStore("connection", () => {
     node.isLoading = true;
     try {
       const collections = await api.mongoListCollections(connectionId, database);
+      const names = collections.map((c) => c.name);
       setChildren(
         node,
-        sortSidebarNames(collections).map((col) => ({
+        sortSidebarNames(names).map((col) => ({
           id: `${nodeId}:${col}`,
           label: col,
           type: "mongo-collection" as const,
@@ -2023,6 +2028,31 @@ export const useConnectionStore = defineStore("connection", () => {
     }
   }
 
+  async function loadAllObjectGroupChildren(parent: TreeNode) {
+    if (!parent.connectionId || !hasTreeNodeDatabaseContext(parent)) return;
+    if (!objectTypesForGroupNode(parent.type)) return;
+    parent.isLoading = true;
+    try {
+      await ensureConnected(parent.connectionId);
+      if (!isTreeNodeChildrenLoaded(parent.id)) {
+        await loadObjectGroupChildren(parent);
+      }
+
+      let loadMoreNode = parent.children?.find((child) => child.type === "load-more");
+      while (loadMoreNode?.loadMore) {
+        loadMoreNode.isLoading = true;
+        await loadMoreObjectGroupChildren(loadMoreNode);
+        loadMoreNode = parent.children?.find((child) => child.type === "load-more");
+      }
+      parent.isExpanded = true;
+    } catch (e) {
+      recordMetadataLoadError(parent.connectionId, e);
+      throw e;
+    } finally {
+      parent.isLoading = false;
+    }
+  }
+
   function normalizedObjectTreeKind(type: string): DatabaseObjectTreeKind {
     return normalizeSidebarObjectKind(type);
   }
@@ -2291,7 +2321,7 @@ export const useConnectionStore = defineStore("connection", () => {
         await loadMongoDatabases(node.connectionId);
       } else if (config?.db_type === "elasticsearch") {
         await loadElasticsearchIndices(node.connectionId);
-      } else if (config?.db_type === "qdrant" || config?.db_type === "milvus" || config?.db_type === "weaviate") {
+      } else if (config?.db_type === "qdrant" || config?.db_type === "milvus" || config?.db_type === "weaviate" || config?.db_type === "chromadb") {
         await loadVectorCollections(node.connectionId);
       } else if (config?.db_type === "mq") {
         await loadMqTenants(node.connectionId, options);
@@ -2779,7 +2809,7 @@ export const useConnectionStore = defineStore("connection", () => {
     if (cached) return cached;
     return withCompletionInFlight(`${cacheKey}:mongo-collections`, async () => {
       await ensureConnected(connectionId);
-      const collections = sortSidebarNames(await api.mongoListCollections(connectionId, database));
+      const collections = sortSidebarNames((await api.mongoListCollections(connectionId, database)).map((c) => c.name));
       mongoCompletionCollectionsCache.value[cacheKey] = collections;
       evictOldestCacheEntries(mongoCompletionCollectionsCache.value, COMPLETION_CACHE_MAX);
       return collections;
@@ -3630,6 +3660,7 @@ export const useConnectionStore = defineStore("connection", () => {
     loadTables,
     loadObjectGroupChildren,
     loadMoreObjectGroupChildren,
+    loadAllObjectGroupChildren,
     loadTableGroups,
     loadColumns,
     loadIndexes,
