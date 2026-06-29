@@ -1707,10 +1707,12 @@ export const useConnectionStore = defineStore("connection", () => {
     const node = findNode(treeNodes.value, connectionId);
     if (!node) return;
 
+    const config = getConfig(connectionId);
+    const database = config?.database || "default";
     node.isLoading = true;
     try {
       await ensureConnected(connectionId);
-      const collections = await withMetadataLoadTimeout(connectionId, api.vectorListCollections(connectionId), "vector collections");
+      const collections = await withMetadataLoadTimeout(connectionId, api.vectorListCollections(connectionId, database), "vector collections");
       const sorted = [...collections].sort((a, b) => a.name.localeCompare(b.name));
       setChildren(
         node,
@@ -1721,7 +1723,7 @@ export const useConnectionStore = defineStore("connection", () => {
             label: info.name,
             type: "vector-collection" as const,
             connectionId,
-            database: "default",
+            database,
             isExpanded: false,
             meta: info.dimension != null ? { dimension: info.dimension } : undefined,
           })),
