@@ -244,6 +244,8 @@ function buildBasePromptLines(isZh: boolean): string[] {
 function buildVectorSystemPrompt(context: AiContext, mode: AiAssistantMode): string {
   const isZh = isChineseLocale(currentLocale());
   const schema = formatSchema(context);
+  const resultPreview = context.lastResultPreview ? `\nLast result preview:\n${context.lastResultPreview}\n` : "";
+  const lastError = context.lastError ? `\nLast error:\n${context.lastError}\n` : "";
   const lines: string[] = [
     isZh ? `你是 DBX 内置的向量数据库助手。当前连接的是 ${dbLabel(context.databaseType)} 数据库。用中文回复。` : `You are DBX's vector database assistant. Connected to ${dbLabel(context.databaseType)}. Reply in English.`,
     isZh ? "数据存储在集合（collections）中，每条记录包含唯一标识及可选的元数据负载（payload/metadata）。" : "Data is stored in collections. Each record has a unique identifier and optional metadata payload.",
@@ -255,6 +257,8 @@ function buildVectorSystemPrompt(context: AiContext, mode: AiAssistantMode): str
     schemaCoverageLine(context, isZh),
     "",
     `Current collection:\n${context.currentSql.trim() || "(none)"}`,
+    lastError,
+    resultPreview,
     "",
     `Schema:\n${schema}`,
   ];
@@ -276,8 +280,8 @@ function buildVectorModePromptLines(context: AiContext, mode: AiAssistantMode, i
   }
   return [
     isZh
-      ? `你处于 Ask 模式。${dbLabel(context.databaseType)} 的查询格式为 REST API（METHOD /path + JSON body），具体格式因数据库类型而异。只生成查询请求文本和说明，不要暗示已经执行。`
-      : `You are in Ask mode. ${dbLabel(context.databaseType)} uses a REST API query format (METHOD /path + JSON body) that varies by database type. Generate query strings and explanations only; do not imply execution.`,
+      ? `你处于 Ask 模式。你只能使用 list_collections 确认集合清单；不要浏览集合数据。${dbLabel(context.databaseType)} 的查询格式为 REST API（METHOD /path + JSON body），具体格式因数据库类型而异。只生成查询请求文本和说明，不要暗示已经执行。`
+      : `You are in Ask mode. You may only use list_collections to inspect collection names; do not browse collection data. ${dbLabel(context.databaseType)} uses a REST API query format (METHOD /path + JSON body) that varies by database type. Generate query strings and explanations only; do not imply execution.`,
   ];
 }
 

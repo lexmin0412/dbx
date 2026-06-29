@@ -36,7 +36,7 @@ pub fn is_vector_db(db_type: DatabaseType) -> bool {
 /// Returns vector tools for vector DBs, SQL tools otherwise.
 pub fn read_only_tools(db_type: DatabaseType) -> Vec<ToolDefinition> {
     if is_vector_db(db_type) {
-        vec![list_collections_tool(), browse_collection_tool()]
+        vec![list_collections_tool()]
     } else {
         vec![list_tables_tool(), get_columns_tool()]
     }
@@ -761,6 +761,22 @@ async fn resolve_chroma_collection_uuid(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn vector_read_only_tools_do_not_include_collection_browsing() {
+        let tools = read_only_tools(DatabaseType::Qdrant);
+        let names: Vec<&str> = tools.iter().map(|tool| tool.name).collect();
+
+        assert_eq!(names, vec!["list_collections"]);
+    }
+
+    #[test]
+    fn vector_agent_tools_include_collection_browsing() {
+        let tools = all_tools(DatabaseType::Qdrant);
+        let names: Vec<&str> = tools.iter().map(|tool| tool.name).collect();
+
+        assert_eq!(names, vec!["list_collections", "browse_collection"]);
+    }
 
     #[test]
     fn build_browse_query_qdrant() {

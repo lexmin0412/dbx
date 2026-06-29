@@ -824,7 +824,7 @@ pub async fn list_vector_collections_core(
     database: &str,
 ) -> Result<Vec<db::vector_driver::CollectionInfo>, String> {
     let pool_key =
-        if database.is_empty() { connection_id.to_string() } else { format!("{}:{}", connection_id, database) };
+        state.get_or_create_pool(connection_id, if database.is_empty() { None } else { Some(database) }).await?;
     let client = {
         let connections = state.connections.read().await;
         match connections.get(&pool_key) {

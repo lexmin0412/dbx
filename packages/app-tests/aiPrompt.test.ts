@@ -164,8 +164,24 @@ test("vector ask mode mentions REST API format", () => {
 
   assert.match(prompt, /REST API/);
   assert.match(prompt, /Qdrant/);
+  assert.match(prompt, /list_collections/);
+  assert.match(prompt, /do not browse collection data|不要浏览集合数据/);
   assert.doesNotMatch(prompt, /```sql/);
   assert.doesNotMatch(prompt, /execute_query/);
+});
+
+test("vector system prompt preserves last error and result preview", () => {
+  const prompt = buildSystemPrompt(
+    "generate",
+    vectorContext({
+      lastError: "Qdrant error",
+      lastResultPreview: "id | payload\n1 | {}",
+    }),
+    "ask",
+  );
+
+  assert.match(prompt, /Last error:\nQdrant error/);
+  assert.match(prompt, /Last result preview:\nid \| payload/);
 });
 
 test("buildUserPrompt skips action instruction for vector databases", () => {
