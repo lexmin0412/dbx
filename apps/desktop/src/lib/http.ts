@@ -49,6 +49,7 @@ import type {
   DriverInstallProgress,
   JavaRuntimeConfig,
   UpdateInfo,
+  UpdateDownloadSource,
   RedisDatabaseInfo,
   RedisValue,
   RedisScanResult,
@@ -57,6 +58,7 @@ import type {
   RedisNodeEndpoint,
   KvValue,
   KvListPrefixResponse,
+  KvListPrefixOptions,
   KvGetResponse,
   KvPutOptions,
   KvPutResponse,
@@ -88,7 +90,17 @@ import type {
   DroppedFilePreviewSqlOptions,
 } from "./tauri";
 import type { QueryEditability } from "@/lib/sqlAnalysis";
-import type { DataGridColumnValueFilterConditionOptions, DataGridContextFilterConditionOptions, DataGridCountSqlOptions, DataGridCopyInsertStatementOptions, DataGridCopyUpdateStatementOptions, DataGridSaveStatementOptions, HiveTablePropertiesSqlOptions } from "@/lib/dataGridSql";
+import type {
+  DataGridColumnDistinctValuesSqlOptions,
+  DataGridColumnValueFilterConditionOptions,
+  DataGridColumnValuesFilterConditionOptions,
+  DataGridContextFilterConditionOptions,
+  DataGridCountSqlOptions,
+  DataGridCopyInsertStatementOptions,
+  DataGridCopyUpdateStatementOptions,
+  DataGridSaveStatementOptions,
+  HiveTablePropertiesSqlOptions,
+} from "@/lib/dataGridSql";
 import type { BuildTableStructureChangeSqlOptions, BuildSingleColumnAlterSqlOptions, TableStructureChangeSql } from "@/lib/tableStructureEditorSql";
 import type { BuildTableSelectSqlOptions } from "@/lib/tableSelectSql";
 import type { DatabaseSearchSql, DatabaseSearchSqlOptions, SearchResultWhereOptions } from "@/lib/databaseSearch";
@@ -99,6 +111,7 @@ import type { CreateDatabaseSqlOptions } from "@/lib/createDatabaseSql";
 import type { DatabaseNameSqlOptions, DropTableChildObjectSqlOptions, DropObjectSqlOptions, DuplicateTableStructureSqlOptions, SchemaNameSqlOptions, TableAdminSqlOptions } from "@/lib/dbAdminSql";
 import type { BuildDatabaseSqlExportOptions, BuildExportInsertStatementsOptions } from "@/lib/databaseExport";
 import type { DataCompareFromTablesOptions, DataCompareFromTablesPreparation, DataCompareSyncPlan, DataCompareSyncPlanOptions, DataComparePreparation, DataComparePreparationOptions } from "@/lib/dataCompare";
+import { apiUrl } from "@/lib/webPath";
 import type { DataGridSavePreparation } from "./tauri";
 import type {
   NacosConfigHistoryKey,
@@ -143,7 +156,7 @@ const DEFAULT_DESKTOP_SETTINGS: DesktopSettings = {
 };
 
 async function post<T>(url: string, body: unknown): Promise<T> {
-  const res = await fetch(url, {
+  const res = await fetch(apiUrl(url), {
     method: "POST",
     headers: { "Content-Type": "application/json" },
     body: JSON.stringify(body),
@@ -153,13 +166,13 @@ async function post<T>(url: string, body: unknown): Promise<T> {
 }
 
 async function get<T>(url: string): Promise<T> {
-  const res = await fetch(url);
+  const res = await fetch(apiUrl(url));
   if (!res.ok) throw new Error(await res.text());
   return res.json();
 }
 
 async function del<T>(url: string): Promise<T> {
-  const res = await fetch(url, { method: "DELETE" });
+  const res = await fetch(apiUrl(url), { method: "DELETE" });
   if (!res.ok) throw new Error(await res.text());
   return res.json();
 }
@@ -247,7 +260,7 @@ export async function importJdbcDrivers(pathsOrFiles: (string | File)[]): Promis
       formData.append("files", blob, fileName);
     }
   }
-  const res = await fetch("/api/jdbc/drivers", { method: "POST", body: formData });
+  const res = await fetch(apiUrl("/api/jdbc/drivers"), { method: "POST", body: formData });
   if (!res.ok) throw new Error(await res.text());
   return res.json();
 }
@@ -289,7 +302,7 @@ export async function installJdbcPluginLocal(pathOrFile: string | File): Promise
   }
   const formData = new FormData();
   formData.append("file", blob, fileName);
-  const uploadRes = await fetch("/api/jdbc/plugin/install-local", { method: "POST", body: formData });
+  const uploadRes = await fetch(apiUrl("/api/jdbc/plugin/install-local"), { method: "POST", body: formData });
   if (!uploadRes.ok) throw new Error(await uploadRes.text());
   return uploadRes.json();
 }
@@ -356,7 +369,7 @@ export async function importAgentsFromZip(fileOrPath: string | File): Promise<nu
   }
   const formData = new FormData();
   formData.append("file", fileOrPath);
-  const res = await fetch("/api/agents/import-offline", { method: "POST", body: formData });
+  const res = await fetch(apiUrl("/api/agents/import-offline"), { method: "POST", body: formData });
   if (!res.ok) throw new Error(await res.text());
   const result: { count: number } = await res.json();
   return result.count;
@@ -375,7 +388,7 @@ export async function importAgentJar(dbType: string, pathOrFile: string | File):
   const formData = new FormData();
   formData.append("dbType", dbType);
   formData.append("file", blob, fileName);
-  const uploadRes = await fetch("/api/agents/import-jar", { method: "POST", body: formData });
+  const uploadRes = await fetch(apiUrl("/api/agents/import-jar"), { method: "POST", body: formData });
   if (!uploadRes.ok) throw new Error(await uploadRes.text());
 }
 
@@ -388,7 +401,7 @@ export async function uninstallJre(jreKey: string): Promise<void> {
 }
 
 export async function listenAgentInstallProgress(handler: (progress: DriverInstallProgress) => void): Promise<() => void> {
-  const es = new EventSource("/api/agents/progress/global");
+  const es = new EventSource(apiUrl("/api/agents/progress/global"));
   es.onmessage = (event) => {
     try {
       handler(JSON.parse(event.data));
@@ -401,6 +414,10 @@ export async function listenAgentInstallProgress(handler: (progress: DriverInsta
 
 export async function loadSavedSqlLibrary(): Promise<SavedSqlLibrary> {
   return get("/api/saved-sql");
+}
+
+export async function loadSavedSqlFile(id: string): Promise<SavedSqlFile | null> {
+  return get(`/api/saved-sql/${encodeURIComponent(id)}`);
 }
 
 export async function saveSavedSqlFolder(folder: SavedSqlFolder): Promise<SavedSqlFolder> {
@@ -525,6 +542,10 @@ export async function getObjectSource(connectionId: string, database: string, sc
 
 export async function getColumns(connectionId: string, database: string, schema: string, table: string): Promise<ColumnInfo[]> {
   return get(`/api/schema/columns?${qs({ connection_id: connectionId, database, schema, table })}`);
+}
+
+export async function listDataTypes(connectionId: string, database: string): Promise<string[]> {
+  return get(`/api/schema/data-types?${qs({ connection_id: connectionId, database })}`);
 }
 
 export async function listIndexes(connectionId: string, database: string, schema: string, table: string): Promise<IndexInfo[]> {
@@ -798,6 +819,15 @@ export async function buildDataGridColumnValueFilterCondition(options: DataGridC
   return result ?? undefined;
 }
 
+export async function buildDataGridColumnValuesFilterCondition(options: DataGridColumnValuesFilterConditionOptions): Promise<string | undefined> {
+  const result = await post<string | null>("/api/query/build-data-grid-column-values-filter-condition", { options });
+  return result ?? undefined;
+}
+
+export async function buildDataGridColumnDistinctValuesSql(options: DataGridColumnDistinctValuesSqlOptions): Promise<string> {
+  return post("/api/query/build-data-grid-column-distinct-values-sql", { options });
+}
+
 export async function buildDataGridCountSql(options: DataGridCountSqlOptions): Promise<string> {
   return post("/api/query/build-data-grid-count-sql", { options });
 }
@@ -843,7 +873,7 @@ export async function aiComplete(request: AiCompletionRequest): Promise<string> 
 }
 
 export async function aiStream(sessionId: string, request: AiCompletionRequest, onChunk: (chunk: AiStreamChunk) => void): Promise<void> {
-  const res = await fetch("/api/ai/stream", {
+  const res = await fetch(apiUrl("/api/ai/stream"), {
     method: "POST",
     headers: { "Content-Type": "application/json" },
     body: JSON.stringify({ session_id: sessionId, request }),
@@ -898,7 +928,7 @@ function isAgentEvent(v: unknown): v is import("./tauri").AgentEvent {
 }
 
 export async function aiAgentStream(sessionId: string, request: AiCompletionRequest, connectionId: string, database: string, dbType: string, onEvent: (event: import("./tauri").AgentEvent) => void, mode?: string, signal?: AbortSignal): Promise<string> {
-  const res = await fetch("/api/ai/agent-stream", {
+  const res = await fetch(apiUrl("/api/ai/agent-stream"), {
     method: "POST",
     headers: { "Content-Type": "application/json" },
     body: JSON.stringify({ sessionId, request, connectionId, database, dbType, mode: mode || "ask" }),
@@ -1083,7 +1113,7 @@ export async function previewSqlFile(fileOrPath: string | File): Promise<SqlFile
   }
   const formData = new FormData();
   formData.append("file", fileOrPath);
-  const res = await fetch("/api/sql-file/preview", { method: "POST", body: formData });
+  const res = await fetch(apiUrl("/api/sql-file/preview"), { method: "POST", body: formData });
   if (!res.ok) throw new Error(await res.text());
   return res.json();
 }
@@ -1130,7 +1160,7 @@ export async function writeExternalSqlFile(_path: string, _content: string): Pro
 
 export async function startTransfer(request: TransferRequest, onProgress: (progress: TransferProgress) => void): Promise<void> {
   // 1. POST to start the transfer
-  const res = await fetch("/api/transfer/start", {
+  const res = await fetch(apiUrl("/api/transfer/start"), {
     method: "POST",
     headers: { "Content-Type": "application/json" },
     body: JSON.stringify({ request }),
@@ -1139,11 +1169,11 @@ export async function startTransfer(request: TransferRequest, onProgress: (progr
 
   // 2. SSE to listen for progress
   return new Promise((resolve, reject) => {
-    const es = new EventSource(`/api/transfer/progress/${request.transferId}`);
+    const es = new EventSource(apiUrl(`/api/transfer/progress/${request.transferId}`));
     es.onmessage = (e) => {
       const progress: TransferProgress = JSON.parse(e.data);
       onProgress(progress);
-      if (progress.status === "done" || progress.status === "cancelled") {
+      if (progress.status === "done" || progress.status === "error" || progress.status === "cancelled") {
         es.close();
         resolve();
       }
@@ -1181,14 +1211,14 @@ export async function previewTableImportFile(fileOrPath: string | File): Promise
   }
   const formData = new FormData();
   formData.append("file", fileOrPath);
-  const res = await fetch("/api/import/preview", { method: "POST", body: formData });
+  const res = await fetch(apiUrl("/api/import/preview"), { method: "POST", body: formData });
   if (!res.ok) throw new Error(await res.text());
   return res.json();
 }
 
 export async function importTableFile(request: TableImportRequest, onProgress: (progress: TableImportProgress) => void): Promise<TableImportSummary> {
   // 1. POST to start the import
-  const res = await fetch("/api/import/execute", {
+  const res = await fetch(apiUrl("/api/import/execute"), {
     method: "POST",
     headers: { "Content-Type": "application/json" },
     body: JSON.stringify({ request }),
@@ -1197,7 +1227,7 @@ export async function importTableFile(request: TableImportRequest, onProgress: (
 
   // 2. SSE to listen for progress
   return new Promise((resolve, reject) => {
-    const es = new EventSource(`/api/import/progress/${request.importId}`);
+    const es = new EventSource(apiUrl(`/api/import/progress/${request.importId}`));
     let summary: TableImportSummary | null = null;
     es.onmessage = (e) => {
       const progress: TableImportProgress = JSON.parse(e.data);
@@ -1232,7 +1262,7 @@ export async function cancelTableImport(importId: string): Promise<boolean> {
 
 export async function exportDatabaseSql(request: DatabaseExportRequest, onProgress: (progress: ExportProgress) => void): Promise<void> {
   // 1. POST to start the export
-  const res = await fetch("/api/export/database", {
+  const res = await fetch(apiUrl("/api/export/database"), {
     method: "POST",
     headers: { "Content-Type": "application/json" },
     body: JSON.stringify({ request }),
@@ -1241,7 +1271,7 @@ export async function exportDatabaseSql(request: DatabaseExportRequest, onProgre
 
   // 2. SSE to listen for progress
   return new Promise((resolve, reject) => {
-    const es = new EventSource(`/api/export/database/progress/${request.exportId}`);
+    const es = new EventSource(apiUrl(`/api/export/database/progress/${request.exportId}`));
     es.onmessage = (e) => {
       const progress: ExportProgress = JSON.parse(e.data);
       onProgress(progress);
@@ -1264,7 +1294,7 @@ export async function exportDatabaseSql(request: DatabaseExportRequest, onProgre
 
 function downloadDatabaseExportFile(exportId: string): void {
   const a = document.createElement("a");
-  a.href = `/api/export/database/download/${exportId}`;
+  a.href = apiUrl(`/api/export/database/download/${exportId}`);
   a.click();
 }
 
@@ -1280,7 +1310,7 @@ export async function startTableExport(request: TableExportRequest, onProgress: 
   return new Promise((resolve, reject) => {
     let started = false;
     let settled = false;
-    const eventSource = new EventSource(`/api/export/table/progress/${exportId}`);
+    const eventSource = new EventSource(apiUrl(`/api/export/table/progress/${exportId}`));
 
     const finish = (callback: () => void) => {
       if (settled) return;
@@ -1322,7 +1352,7 @@ export async function startTableExport(request: TableExportRequest, onProgress: 
 function downloadTableExportFile(exportId: string, format: string): void {
   const ext = format === "markdown" || format === "md" ? "md" : format;
   const a = document.createElement("a");
-  a.href = `/api/export/table/download/${exportId}`;
+  a.href = apiUrl(`/api/export/table/download/${exportId}`);
   a.download = `table_export_${exportId}.${ext}`;
   a.click();
 }
@@ -1337,7 +1367,7 @@ export async function startQueryResultExport(request: QueryResultExportRequest, 
   return new Promise((resolve, reject) => {
     let started = false;
     let settled = false;
-    const eventSource = new EventSource(`/api/export/query-result/progress/${exportId}`);
+    const eventSource = new EventSource(apiUrl(`/api/export/query-result/progress/${exportId}`));
 
     const finish = (callback: () => void) => {
       if (settled) return;
@@ -1377,7 +1407,7 @@ export async function startQueryResultExport(request: QueryResultExportRequest, 
 
 function downloadQueryResultExportFile(exportId: string, format: string): void {
   const a = document.createElement("a");
-  a.href = `/api/export/query-result/download/${exportId}`;
+  a.href = apiUrl(`/api/export/query-result/download/${exportId}`);
   a.download = `query_result_export_${exportId}.${format}`;
   a.click();
 }
@@ -1597,8 +1627,8 @@ export async function etcdDelete(connectionId: string, key: string): Promise<KvD
 // ZooKeeper
 // ---------------------------------------------------------------------------
 
-export async function zookeeperListPrefix(connectionId: string, prefix: string, limit: number, continuation?: string | null): Promise<KvListPrefixResponse> {
-  return post("/api/zookeeper/list-prefix", { connectionId, prefix, limit, continuation });
+export async function zookeeperListPrefix(connectionId: string, prefix: string, limit: number, continuation?: string | null, options?: KvListPrefixOptions | null): Promise<KvListPrefixResponse> {
+  return post("/api/zookeeper/list-prefix", { connectionId, prefix, limit, continuation, recursive: options?.recursive ?? null });
 }
 
 export async function zookeeperGet(connectionId: string, key: string): Promise<KvGetResponse> {
@@ -1710,12 +1740,16 @@ export async function vectorListCollections(connectionId: string): Promise<Colle
   return mongoListCollections(connectionId, "default");
 }
 
-export async function mongoFindDocuments(connectionId: string, database: string, collection: string, skip: number, limit: number, filter?: string, sort?: string, executionId?: string): Promise<MongoDocumentResult> {
-  return post("/api/mongo/find-documents", { connectionId, database, collection, skip, limit, filter, sort, executionId });
+export async function mongoFindDocuments(connectionId: string, database: string, collection: string, skip: number, limit: number, filter?: string, projection?: string, sort?: string, executionId?: string): Promise<MongoDocumentResult> {
+  return post("/api/mongo/find-documents", { connectionId, database, collection, skip, limit, filter, projection, sort, executionId });
 }
 
-export async function documentFindDocuments(connectionId: string, database: string, collection: string, skip: number, limit: number, filter?: string, sort?: string, executionId?: string): Promise<MongoDocumentResult> {
-  return post("/api/document-store/find-documents", { connectionId, database, collection, skip, limit, filter, sort, executionId });
+export async function documentFindDocuments(connectionId: string, database: string, collection: string, skip: number, limit: number, filter?: string, projection?: string, sort?: string, executionId?: string): Promise<MongoDocumentResult> {
+  return post("/api/document-store/find-documents", { connectionId, database, collection, skip, limit, filter, projection, sort, executionId });
+}
+
+export async function mongoServerVersion(connectionId: string, database: string, executionId?: string): Promise<string> {
+  return post("/api/mongo/server-version", { connectionId, database, executionId });
 }
 
 export async function mongoAggregateDocuments(connectionId: string, database: string, collection: string, pipelineJson: string, maxRows?: number, executionId?: string): Promise<MongoDocumentResult> {
@@ -1804,6 +1838,10 @@ export async function installMcpServer(): Promise<string> {
 
 export async function getSystemProxyUrl(): Promise<string | null> {
   return null;
+}
+
+export async function downloadAndInstallUpdate(_source: UpdateDownloadSource, _latestVersion?: string): Promise<void> {
+  throw new Error("In-app update installation is only available in the desktop app.");
 }
 
 export async function getAppVersion(): Promise<string> {

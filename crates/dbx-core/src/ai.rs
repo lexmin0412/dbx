@@ -61,6 +61,8 @@ pub enum AiApiStyle {
     #[default]
     Completions,
     Responses,
+    #[serde(rename = "anthropic-messages")]
+    AnthropicMessages,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Default)]
@@ -155,12 +157,25 @@ pub struct ToolCallRef {
     pub arguments: serde_json::Value,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+#[serde(rename_all = "camelCase")]
+pub struct AiTaskContract {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub action: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub mode: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub user_request: Option<String>,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct AiCompletionRequest {
     pub config: AiConfig,
     pub system_prompt: String,
     pub messages: Vec<AiMessage>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub task_contract: Option<AiTaskContract>,
     pub max_tokens: Option<u32>,
     pub temperature: Option<f32>,
 }
@@ -251,6 +266,15 @@ fn ensure_openai_version_prefix(endpoint: &str) -> String {
     }
 }
 
+fn ensure_anthropic_version_prefix(endpoint: &str) -> String {
+    let ep = endpoint.trim().trim_end_matches('/');
+    if ep.ends_with("/v1") {
+        ep.to_string()
+    } else {
+        format!("{ep}/v1")
+    }
+}
+
 pub fn resolve_endpoint(config: &AiConfig) -> String {
     let ep = config.endpoint.trim().trim_end_matches('/');
     if matches!(config.provider, AiProvider::Gemini) {
@@ -263,9 +287,11 @@ pub fn resolve_endpoint(config: &AiConfig) -> String {
     if ep.ends_with("/chat/completions") || ep.ends_with("/responses") || ep.ends_with("/messages") {
         return ep.to_string();
     }
+    if uses_anthropic_messages_api(config) {
+        let base = ensure_anthropic_version_prefix(ep);
+        return format!("{base}/messages");
+    }
     match config.provider {
-        AiProvider::Claude => format!("{ep}/messages"),
-        AiProvider::CodexCli => unreachable!(),
         AiProvider::Openai
         | AiProvider::Deepseek
         | AiProvider::Qwen
@@ -279,8 +305,13 @@ pub fn resolve_endpoint(config: &AiConfig) -> String {
                 format!("{base}/chat/completions")
             }
         }
-        AiProvider::Gemini => unreachable!(),
+        AiProvider::Claude | AiProvider::CodexCli | AiProvider::Gemini => unreachable!(),
     }
+}
+
+pub fn uses_anthropic_messages_api(config: &AiConfig) -> bool {
+    matches!(config.provider, AiProvider::Claude)
+        || matches!(config.provider, AiProvider::Custom) && config.api_style == AiApiStyle::AnthropicMessages
 }
 
 fn resolve_gemini_stream_endpoint(config: &AiConfig) -> String {
@@ -312,6 +343,11 @@ pub fn resolve_model_list_endpoint(config: &AiConfig) -> Result<String, String> 
         .unwrap_or(ep)
         .trim_end_matches('/');
 
+    if uses_anthropic_messages_api(config) {
+        let base = ensure_anthropic_version_prefix(base);
+        return Ok(format!("{base}/models"));
+    }
+
     let base = ensure_openai_version_prefix(base);
 
     Ok(format!("{base}/models"))
@@ -329,6 +365,17 @@ pub fn stream_data_payload(line: &str) -> Option<&str> {
         return Some(line);
     }
     None
+}
+
+fn drain_next_stream_line(buffer: &mut Vec<u8>) -> Result<Option<String>, String> {
+    let Some(pos) = buffer.iter().position(|byte| *byte == b'\n') else {
+        return Ok(None);
+    };
+    let mut line = buffer.drain(..=pos).collect::<Vec<u8>>();
+    if line.last() == Some(&b'\n') {
+        line.pop();
+    }
+    String::from_utf8(line).map(Some).map_err(|e| format!("AI stream returned invalid UTF-8: {e}"))
 }
 
 pub fn claude_stream_text(event: &serde_json::Value) -> Option<&str> {
@@ -671,8 +718,14 @@ pub async fn list_models_core(config: &AiConfig) -> Result<Vec<AiModelInfo>, Str
         | AiProvider::Deepseek
         | AiProvider::Qwen
         | AiProvider::Ollama
-        | AiProvider::OpenaiCompatible
-        | AiProvider::Custom => list_openai_compatible_models(&client, config).await,
+        | AiProvider::OpenaiCompatible => list_openai_compatible_models(&client, config).await,
+        AiProvider::Custom => {
+            if uses_anthropic_messages_api(config) {
+                list_claude_models(&client, config).await
+            } else {
+                list_openai_compatible_models(&client, config).await
+            }
+        }
         AiProvider::CodexCli => unreachable!(),
         AiProvider::Gemini => {
             Err("Model listing is only supported for OpenAI-compatible and Claude providers".to_string())
@@ -828,15 +881,12 @@ async fn measure_first_stream_chunk(
     is_claude: bool,
     is_gemini: bool,
 ) -> Result<(u64, String), String> {
-    let mut buf = String::new();
+    let mut buf = Vec::new();
     while let Some(chunk) = byte_stream.next().await {
         let chunk = chunk.map_err(|e| format!("stream read error: {e}"))?;
-        buf.push_str(&String::from_utf8_lossy(&chunk));
+        buf.extend_from_slice(&chunk);
 
-        while let Some(pos) = buf.find('\n') {
-            let line = buf[..pos].to_string();
-            buf = buf[pos + 1..].to_string();
-
+        while let Some(line) = drain_next_stream_line(&mut buf)? {
             let Some(data) = stream_data_payload(&line) else { continue };
             if data == "[DONE]" {
                 // stream finished without content — not a real failure but rare
@@ -903,7 +953,7 @@ pub async fn test_connection_core(config: &AiConfig) -> Result<AiTestConnectionR
     let client = build_ai_http_client(config, 15)?;
     let start = std::time::Instant::now();
 
-    let is_claude = matches!(config.provider, AiProvider::Claude);
+    let is_claude = uses_anthropic_messages_api(config);
     let is_gemini = matches!(config.provider, AiProvider::Gemini);
     let model = config.model.clone();
 
@@ -944,6 +994,28 @@ pub async fn test_connection_core(config: &AiConfig) -> Result<AiTestConnectionR
                 .send()
                 .await
                 .map_err(|e| format!("Gemini request failed: {e}"))?;
+            if !res.status().is_success() {
+                let data: serde_json::Value = res.json().await.map_err(|e| e.to_string())?;
+                return Err(categorize_error(&data, config));
+            }
+            res.bytes_stream()
+        }
+        AiProvider::Custom if uses_anthropic_messages_api(config) => {
+            let body = json!({
+                "model": &model,
+                "max_tokens": 16,
+                "temperature": temperature_value(Some(0.0)),
+                "system": CLAUDE_DEFAULT_SYSTEM,
+                "messages": [{ "role": "user", "content": TEST_PROMPT }],
+                "stream": true,
+            });
+            let res = client
+                .post(resolve_endpoint(config))
+                .headers(claude_headers(config)?)
+                .json(&body)
+                .send()
+                .await
+                .map_err(|e| format!("Claude request failed: {e}"))?;
             if !res.status().is_success() {
                 let data: serde_json::Value = res.json().await.map_err(|e| e.to_string())?;
                 return Err(categorize_error(&data, config));
@@ -1058,9 +1130,17 @@ pub async fn complete(request: &AiCompletionRequest) -> Result<String, String> {
         | AiProvider::Deepseek
         | AiProvider::Qwen
         | AiProvider::Ollama
-        | AiProvider::OpenaiCompatible
-        | AiProvider::Custom => {
+        | AiProvider::OpenaiCompatible => {
             if request.config.api_style == AiApiStyle::Responses {
+                call_responses_api(&client, request.clone()).await
+            } else {
+                call_openai_compatible(&client, request.clone()).await
+            }
+        }
+        AiProvider::Custom => {
+            if uses_anthropic_messages_api(&request.config) {
+                call_claude(&client, request.clone()).await
+            } else if request.config.api_style == AiApiStyle::Responses {
                 call_responses_api(&client, request.clone()).await
             } else {
                 call_openai_compatible(&client, request.clone()).await
@@ -1096,9 +1176,17 @@ pub async fn stream(
         | AiProvider::Deepseek
         | AiProvider::Qwen
         | AiProvider::Ollama
-        | AiProvider::OpenaiCompatible
-        | AiProvider::Custom => {
+        | AiProvider::OpenaiCompatible => {
             if request.config.api_style == AiApiStyle::Responses {
+                stream_responses_api(&client, session_id, request, cancelled, &on_chunk).await
+            } else {
+                stream_openai(&client, session_id, request, cancelled, &on_chunk).await
+            }
+        }
+        AiProvider::Custom => {
+            if uses_anthropic_messages_api(&request.config) {
+                stream_claude(&client, session_id, request, cancelled, &on_chunk).await
+            } else if request.config.api_style == AiApiStyle::Responses {
                 stream_responses_api(&client, session_id, request, cancelled, &on_chunk).await
             } else {
                 stream_openai(&client, session_id, request, cancelled, &on_chunk).await
@@ -1137,20 +1225,17 @@ async fn stream_claude(
     }
 
     let mut byte_stream = res.bytes_stream();
-    let mut buf = String::new();
+    let mut buf = Vec::new();
 
     loop {
         tokio::select! {
             chunk = byte_stream.next() => {
                 let Some(chunk) = chunk else { break };
                 let chunk = chunk.map_err(|e| e.to_string())?;
-                buf.push_str(&String::from_utf8_lossy(&chunk));
+                buf.extend_from_slice(&chunk);
 
                 let mut finished = false;
-                while let Some(pos) = buf.find('\n') {
-                    let line = buf[..pos].to_string();
-                    buf = buf[pos + 1..].to_string();
-
+                while let Some(line) = drain_next_stream_line(&mut buf)? {
                     let Some(data) = stream_data_payload(&line) else { continue };
                     if data == "[DONE]" {
                         finished = true;
@@ -1224,20 +1309,17 @@ async fn stream_openai(
     }
 
     let mut byte_stream = res.bytes_stream();
-    let mut buf = String::new();
+    let mut buf = Vec::new();
 
     loop {
         tokio::select! {
             chunk = byte_stream.next() => {
                 let Some(chunk) = chunk else { break };
                 let chunk = chunk.map_err(|e| e.to_string())?;
-                buf.push_str(&String::from_utf8_lossy(&chunk));
+                buf.extend_from_slice(&chunk);
 
                 let mut finished = false;
-                while let Some(pos) = buf.find('\n') {
-                    let line = buf[..pos].to_string();
-                    buf = buf[pos + 1..].to_string();
-
+                while let Some(line) = drain_next_stream_line(&mut buf)? {
                     let Some(data) = stream_data_payload(&line) else { continue };
                     if data == "[DONE]" {
                         finished = true;
@@ -1311,20 +1393,17 @@ async fn stream_responses_api(
     }
 
     let mut byte_stream = res.bytes_stream();
-    let mut buf = String::new();
+    let mut buf = Vec::new();
 
     loop {
         tokio::select! {
             chunk = byte_stream.next() => {
                 let Some(chunk) = chunk else { break };
                 let chunk = chunk.map_err(|e| e.to_string())?;
-                buf.push_str(&String::from_utf8_lossy(&chunk));
+                buf.extend_from_slice(&chunk);
 
                 let mut finished = false;
-                while let Some(pos) = buf.find('\n') {
-                    let line = buf[..pos].to_string();
-                    buf = buf[pos + 1..].to_string();
-
+                while let Some(line) = drain_next_stream_line(&mut buf)? {
                     let Some(data) = stream_data_payload(&line) else { continue };
                     if data == "[DONE]" {
                         finished = true;
@@ -1401,19 +1480,16 @@ async fn stream_gemini(
     }
 
     let mut byte_stream = res.bytes_stream();
-    let mut buf = String::new();
+    let mut buf = Vec::new();
 
     loop {
         tokio::select! {
             chunk = byte_stream.next() => {
                 let Some(chunk) = chunk else { break };
                 let chunk = chunk.map_err(|e| e.to_string())?;
-                buf.push_str(&String::from_utf8_lossy(&chunk));
+                buf.extend_from_slice(&chunk);
 
-                while let Some(pos) = buf.find('\n') {
-                    let line = buf[..pos].to_string();
-                    buf = buf[pos + 1..].to_string();
-
+                while let Some(line) = drain_next_stream_line(&mut buf)? {
                     let Some(data) = stream_data_payload(&line) else { continue };
                     if let Ok(event) = serde_json::from_str::<serde_json::Value>(data) {
                         let text = gemini_text(&event);
@@ -1599,7 +1675,7 @@ async fn stream_claude_with_tools(
     }
 
     let mut byte_stream = res.bytes_stream();
-    let mut buf = String::new();
+    let mut buf = Vec::new();
     // Track the current content block index and type for tool_use blocks
     let mut current_block_index: Option<u32> = None;
     let mut current_block_type: Option<String> = None;
@@ -1610,13 +1686,10 @@ async fn stream_claude_with_tools(
             chunk = byte_stream.next() => {
                 let Some(chunk) = chunk else { break };
                 let chunk = chunk.map_err(|e| e.to_string())?;
-                buf.push_str(&String::from_utf8_lossy(&chunk));
+                buf.extend_from_slice(&chunk);
 
                 let mut finished = false;
-                while let Some(pos) = buf.find('\n') {
-                    let line = buf[..pos].to_string();
-                    buf = buf[pos + 1..].to_string();
-
+                while let Some(line) = drain_next_stream_line(&mut buf)? {
                     let Some(data) = stream_data_payload(&line) else { continue };
                     if data == "[DONE]" {
                         finished = true;
@@ -1776,7 +1849,7 @@ async fn stream_openai_with_tools(
     }
 
     let mut byte_stream = res.bytes_stream();
-    let mut buf = String::new();
+    let mut buf = Vec::new();
     let mut token_usage: Option<TokenUsage> = None;
 
     loop {
@@ -1784,13 +1857,10 @@ async fn stream_openai_with_tools(
             chunk = byte_stream.next() => {
                 let Some(chunk) = chunk else { break };
                 let chunk = chunk.map_err(|e| e.to_string())?;
-                buf.push_str(&String::from_utf8_lossy(&chunk));
+                buf.extend_from_slice(&chunk);
 
                 let mut finished = false;
-                while let Some(pos) = buf.find('\n') {
-                    let line = buf[..pos].to_string();
-                    buf = buf[pos + 1..].to_string();
-
+                while let Some(line) = drain_next_stream_line(&mut buf)? {
                     let Some(data) = stream_data_payload(&line) else { continue };
                     if data == "[DONE]" {
                         finished = true;
@@ -1934,7 +2004,7 @@ async fn stream_gemini_with_tools(
     }
 
     let mut byte_stream = res.bytes_stream();
-    let mut buf = String::new();
+    let mut buf = Vec::new();
     let mut tool_call_idx: u32 = 0;
     let mut token_usage: Option<TokenUsage> = None;
 
@@ -1943,12 +2013,9 @@ async fn stream_gemini_with_tools(
             chunk = byte_stream.next() => {
                 let Some(chunk) = chunk else { break };
                 let chunk = chunk.map_err(|e| e.to_string())?;
-                buf.push_str(&String::from_utf8_lossy(&chunk));
+                buf.extend_from_slice(&chunk);
 
-                while let Some(pos) = buf.find('\n') {
-                    let line = buf[..pos].to_string();
-                    buf = buf[pos + 1..].to_string();
-
+                while let Some(line) = drain_next_stream_line(&mut buf)? {
                     let Some(data) = stream_data_payload(&line) else { continue };
                     if let Ok(event) = serde_json::from_str::<serde_json::Value>(data) {
                         // Token usage (overwrite each chunk, keep last value)
@@ -2031,6 +2098,12 @@ pub async fn stream_with_tools(
             })
             .await?
         }
+        AiProvider::Custom if uses_anthropic_messages_api(config) => {
+            stream_claude_with_tools(&client, session_id, request, tools, cancelled, &|event| {
+                accumulator.lock().unwrap().process(event, &on_chunk);
+            })
+            .await?
+        }
         _ => {
             stream_openai_with_tools(&client, session_id, request, tools, cancelled, &|event| {
                 accumulator.lock().unwrap().process(event, &on_chunk);
@@ -2104,11 +2177,33 @@ pub fn load_config(path: &Path) -> Result<Option<AiConfig>, String> {
 mod tests {
     use super::{
         add_temperature_if_supported_for_config, build_ai_http_client, claude_headers, claude_system_prompt,
-        gemini_text, is_kimi_model, openai_response_text, openai_stream_reasoning, openai_stream_text,
-        parse_model_list_response, resolve_endpoint, resolve_model_list_endpoint, responses_max_output_tokens,
-        responses_text, supports_temperature, temperature_value, validate_config, AiApiStyle, AiAuthMethod, AiConfig,
-        AiModelInfo, AiProvider, AiReasoningLevel, AUTHORIZATION, CLAUDE_DEFAULT_SYSTEM, TEST_PROMPT,
+        drain_next_stream_line, gemini_text, is_kimi_model, openai_response_text, openai_stream_reasoning,
+        openai_stream_text, parse_model_list_response, resolve_endpoint, resolve_model_list_endpoint,
+        responses_max_output_tokens, responses_text, stream_data_payload, supports_temperature, temperature_value,
+        uses_anthropic_messages_api, validate_config, AiApiStyle, AiAuthMethod, AiConfig, AiModelInfo, AiProvider,
+        AiReasoningLevel, AUTHORIZATION, CLAUDE_DEFAULT_SYSTEM, TEST_PROMPT,
     };
+
+    #[test]
+    fn stream_line_decoder_preserves_split_multibyte_utf8() {
+        let text = "\u{8bf4}\u{660e}";
+        let json = serde_json::json!({ "delta": text }).to_string();
+        let line = format!("data: {json}\n");
+        let bytes = line.as_bytes();
+        let split = bytes.iter().position(|byte| *byte >= 0x80).unwrap() + 1;
+        let mut buffer = Vec::new();
+
+        buffer.extend_from_slice(&bytes[..split]);
+        assert_eq!(drain_next_stream_line(&mut buffer).unwrap(), None);
+
+        buffer.extend_from_slice(&bytes[split..]);
+        let decoded = drain_next_stream_line(&mut buffer).unwrap().unwrap();
+        let payload = stream_data_payload(&decoded).unwrap();
+        let parsed: serde_json::Value = serde_json::from_str(payload).unwrap();
+
+        assert_eq!(parsed["delta"].as_str(), Some(text));
+        assert!(!decoded.contains('\u{fffd}'));
+    }
 
     #[test]
     fn ai_config_proxy_fields_default_for_legacy_config() {
@@ -2271,6 +2366,49 @@ mod tests {
             codex_cli_env: Default::default(),
         };
         assert_eq!(resolve_model_list_endpoint(&claude).unwrap(), "https://api.anthropic.com/v1/models");
+    }
+
+    #[test]
+    fn custom_anthropic_messages_style_uses_claude_endpoints() {
+        let config = AiConfig {
+            provider: AiProvider::Custom,
+            api_key: "key".to_string(),
+            auth_method: AiAuthMethod::ApiKey,
+            endpoint: "https://gateway.example.com/anthropic/v1".to_string(),
+            model: "claude-sonnet-4-20250514".to_string(),
+            api_style: AiApiStyle::AnthropicMessages,
+            proxy_enabled: false,
+            proxy_url: String::new(),
+            enable_thinking: true,
+            reasoning_level: AiReasoningLevel::Default,
+            context_window: None,
+            codex_cli_path: None,
+            codex_cli_env: Default::default(),
+        };
+
+        assert!(uses_anthropic_messages_api(&config));
+        assert_eq!(resolve_endpoint(&config), "https://gateway.example.com/anthropic/v1/messages");
+        assert_eq!(resolve_model_list_endpoint(&config).unwrap(), "https://gateway.example.com/anthropic/v1/models");
+
+        let full_messages =
+            AiConfig { endpoint: "https://gateway.example.com/anthropic/v1/messages".to_string(), ..config.clone() };
+        assert_eq!(resolve_endpoint(&full_messages), "https://gateway.example.com/anthropic/v1/messages");
+        assert_eq!(
+            resolve_model_list_endpoint(&full_messages).unwrap(),
+            "https://gateway.example.com/anthropic/v1/models"
+        );
+
+        let bare_origin = AiConfig { endpoint: "https://gateway.example.com".to_string(), ..config.clone() };
+        assert_eq!(resolve_endpoint(&bare_origin), "https://gateway.example.com/v1/messages");
+        assert_eq!(resolve_model_list_endpoint(&bare_origin).unwrap(), "https://gateway.example.com/v1/models");
+
+        let kimi_coding = AiConfig {
+            endpoint: "https://api.kimi.com/coding/".to_string(),
+            model: "kimi-for-coding".to_string(),
+            ..config.clone()
+        };
+        assert_eq!(resolve_endpoint(&kimi_coding), "https://api.kimi.com/coding/v1/messages");
+        assert_eq!(resolve_model_list_endpoint(&kimi_coding).unwrap(), "https://api.kimi.com/coding/v1/models");
     }
 
     #[test]

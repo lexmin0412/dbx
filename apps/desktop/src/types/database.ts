@@ -395,6 +395,8 @@ export interface QueryResult {
   truncated?: boolean;
   session_id?: string | null;
   has_more?: boolean;
+  sourceLabel?: string;
+  sourceStatement?: string;
 }
 
 export interface QueryResultRun {
@@ -428,6 +430,7 @@ export interface QueryResultRun {
   queryAnalysis?: QueryTab["queryAnalysis"];
   querySourceColumns?: QueryTab["querySourceColumns"];
   queryEditabilityReason?: QueryTab["queryEditabilityReason"];
+  mongoEditTarget?: QueryTab["mongoEditTarget"];
   tableMeta?: QueryTab["tableMeta"];
 }
 
@@ -650,6 +653,10 @@ export interface QueryTab {
   };
   querySourceColumns?: Array<string | undefined>;
   queryEditabilityReason?: "not-select" | "cte" | "set-operation" | "aggregation" | "external-source" | "complex-source" | "computed-columns" | "no-table" | "no-primary-key" | "primary-key-not-returned" | "aliased-columns" | "metadata-unavailable";
+  mongoEditTarget?: {
+    collection: string;
+    idColumn: "_id";
+  };
   resultEvicted?: boolean;
   whereInput?: string;
   previewSql?: string;
@@ -673,6 +680,7 @@ export interface SavedSqlFile {
   database: string;
   schema?: string;
   sql: string;
+  sqlLoaded?: boolean;
   orderIndex?: number;
   openCount?: number;
   openedAt?: string;

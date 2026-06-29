@@ -5,7 +5,7 @@ mod models;
 mod window_state_guard;
 
 use commands::connection::AppState;
-use dbx_core::storage::{DesktopIconTheme, DesktopSettings, Storage};
+use dbx_core::storage::{maybe_import_user_data_db, DesktopIconTheme, DesktopSettings, Storage};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::time::Instant;
@@ -86,6 +86,19 @@ fn linux_webkit_rendering_workarounds() -> &'static [(&'static str, &'static str
 }
 
 #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+fn linux_system_gtk3_immodules_cache_path() -> Option<&'static str> {
+    [
+        "/usr/lib/x86_64-linux-gnu/gtk-3.0/3.0.0/immodules.cache",
+        "/usr/lib/aarch64-linux-gnu/gtk-3.0/3.0.0/immodules.cache",
+        "/usr/lib64/gtk-3.0/3.0.0/immodules.cache",
+        "/usr/lib/gtk-3.0/3.0.0/immodules.cache",
+    ]
+    .iter()
+    .copied()
+    .find(|path| std::path::Path::new(path).is_file())
+}
+
+#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
 fn linux_appimage_wayland_backend_override(
     appimage: Option<&std::ffi::OsStr>,
     wayland_display: Option<&std::ffi::OsStr>,
@@ -96,6 +109,33 @@ fn linux_appimage_wayland_backend_override(
         // affected Wayland/EGL path, but keep Wayland and other compiled
         // backends as fallbacks for systems without XWayland.
         Some("x11,wayland,*")
+    } else {
+        None
+    }
+}
+
+#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+fn linux_appimage_system_gtk_immodules_cache(
+    appimage: Option<&std::ffi::OsStr>,
+    appdir: Option<&std::ffi::OsStr>,
+    gtk_im_module: Option<&std::ffi::OsStr>,
+    gtk_im_module_file: Option<&std::ffi::OsStr>,
+    system_cache_path: Option<&'static str>,
+) -> Option<&'static str> {
+    let system_cache_path = system_cache_path?;
+    if appimage.is_none() || gtk_im_module.is_none() {
+        return None;
+    }
+
+    let Some(gtk_im_module_file) = gtk_im_module_file else {
+        return Some(system_cache_path);
+    };
+    let Some(appdir) = appdir else {
+        return None;
+    };
+
+    if std::path::Path::new(gtk_im_module_file).starts_with(std::path::Path::new(appdir)) {
+        Some(system_cache_path)
     } else {
         None
     }
@@ -115,6 +155,18 @@ fn apply_linux_webkit_rendering_workarounds() {
     ) {
         std::env::set_var("GDK_BACKEND", gdk_backend);
     }
+    if let Some(gtk_im_module_file) = linux_appimage_system_gtk_immodules_cache(
+        std::env::var_os("APPIMAGE").as_deref(),
+        std::env::var_os("APPDIR").as_deref(),
+        std::env::var_os("GTK_IM_MODULE").as_deref(),
+        std::env::var_os("GTK_IM_MODULE_FILE").as_deref(),
+        linux_system_gtk3_immodules_cache_path(),
+    ) {
+        // linuxdeploy-plugin-gtk points GTK_IM_MODULE_FILE at the bundled
+        // cache. That hides host IM modules such as fcitx5/ibus, so prefer the
+        // host GTK cache when the user has configured a GTK input method.
+        std::env::set_var("GTK_IM_MODULE_FILE", gtk_im_module_file);
+    }
 }
 
 fn show_main_window<R: tauri::Runtime>(app: &tauri::AppHandle<R>) {
@@ -123,6 +175,62 @@ fn show_main_window<R: tauri::Runtime>(app: &tauri::AppHandle<R>) {
         let _ = window.unminimize();
         let _ = window.set_focus();
     }
+}
+
+fn clear_main_webview_focus<R: tauri::Runtime>(app: &tauri::AppHandle<R>) {
+    if let Some(window) = app.get_webview_window("main") {
+        let _ = window.eval(
+            r#"
+            (() => {
+              const active = document.activeElement;
+              if (active instanceof HTMLElement) active.blur();
+              if (document.body) {
+                if (!document.body.hasAttribute("tabindex")) {
+                  document.body.setAttribute("tabindex", "-1");
+                }
+                document.body.focus({ preventScroll: true });
+              }
+            })();
+            "#,
+        );
+    }
+}
+
+fn hide_main_window_for_close<R: tauri::Runtime>(app: &tauri::AppHandle<R>, window: &tauri::Window<R>) {
+    clear_main_webview_focus(app);
+
+    #[cfg(target_os = "macos")]
+    {
+        if window.is_fullscreen().unwrap_or(false) {
+            let app = app.clone();
+            let window = window.clone();
+            let _ = window.set_fullscreen(false);
+            tauri::async_runtime::spawn(async move {
+                for _ in 0..40 {
+                    tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+                    if !window.is_fullscreen().unwrap_or(false) {
+                        tokio::time::sleep(std::time::Duration::from_millis(600)).await;
+                        let app_to_hide = app.clone();
+                        let window_to_hide = window.clone();
+                        let _ = app.run_on_main_thread(move || {
+                            let _ = window_to_hide.hide();
+                            let _ = app_to_hide.hide();
+                        });
+                        return;
+                    }
+                }
+                let app_to_hide = app.clone();
+                let window_to_hide = window.clone();
+                let _ = app.run_on_main_thread(move || {
+                    let _ = window_to_hide.hide();
+                    let _ = app_to_hide.hide();
+                });
+            });
+            return;
+        }
+    }
+
+    let _ = window.hide();
 }
 
 fn open_connection_deep_links(app: &tauri::AppHandle, links: Vec<String>) {
@@ -235,11 +343,13 @@ pub(crate) fn apply_desktop_settings(app: &tauri::AppHandle, desktop_settings: &
 #[allow(clippy::items_after_test_module)]
 mod tests {
     use super::{
-        linux_appimage_wayland_backend_override, linux_webkit_rendering_workarounds,
-        native_window_decorations_override, should_hide_window_on_close, should_setup_desktop_tray,
-        should_show_main_window_after_setup,
+        linux_appimage_system_gtk_immodules_cache, linux_appimage_wayland_backend_override,
+        linux_webkit_rendering_workarounds, native_window_decorations_override, should_hide_window_on_close,
+        should_setup_desktop_tray, should_show_main_window_after_setup,
     };
     use std::ffi::OsStr;
+
+    const TEST_GTK3_IMMODULES_CACHE: &str = "/usr/lib/test/gtk-3.0/3.0.0/immodules.cache";
 
     #[test]
     fn hides_window_on_close_for_windows_and_macos() {
@@ -302,6 +412,78 @@ mod tests {
         assert_eq!(linux_appimage_wayland_backend_override(Some(OsStr::new("/tmp/DBX.AppImage")), None, None), None);
         assert_eq!(linux_appimage_wayland_backend_override(None, Some(OsStr::new("wayland-0")), None), None);
     }
+
+    #[test]
+    fn prefers_system_gtk_immodules_cache_for_appimage_input_methods() {
+        assert_eq!(
+            linux_appimage_system_gtk_immodules_cache(
+                Some(OsStr::new("/tmp/DBX.AppImage")),
+                Some(OsStr::new("/tmp/.mount_DBX123")),
+                Some(OsStr::new("fcitx5")),
+                Some(OsStr::new("/tmp/.mount_DBX123/usr/lib/x86_64-linux-gnu/gtk-3.0/3.0.0/immodules.cache")),
+                Some(TEST_GTK3_IMMODULES_CACHE),
+            ),
+            Some(TEST_GTK3_IMMODULES_CACHE)
+        );
+        assert_eq!(
+            linux_appimage_system_gtk_immodules_cache(
+                Some(OsStr::new("/tmp/DBX.AppImage")),
+                Some(OsStr::new("/tmp/.mount_DBX123")),
+                Some(OsStr::new("ibus")),
+                None,
+                Some(TEST_GTK3_IMMODULES_CACHE),
+            ),
+            Some(TEST_GTK3_IMMODULES_CACHE)
+        );
+    }
+
+    #[test]
+    fn preserves_external_gtk_immodules_cache_overrides() {
+        assert_eq!(
+            linux_appimage_system_gtk_immodules_cache(
+                Some(OsStr::new("/tmp/DBX.AppImage")),
+                Some(OsStr::new("/tmp/.mount_DBX123")),
+                Some(OsStr::new("fcitx5")),
+                Some(OsStr::new("/opt/custom/immodules.cache")),
+                Some(TEST_GTK3_IMMODULES_CACHE),
+            ),
+            None
+        );
+    }
+
+    #[test]
+    fn skips_system_gtk_immodules_cache_without_required_context() {
+        assert_eq!(
+            linux_appimage_system_gtk_immodules_cache(
+                None,
+                Some(OsStr::new("/tmp/.mount_DBX123")),
+                Some(OsStr::new("fcitx5")),
+                Some(OsStr::new("/tmp/.mount_DBX123/usr/lib/x86_64-linux-gnu/gtk-3.0/3.0.0/immodules.cache")),
+                Some(TEST_GTK3_IMMODULES_CACHE),
+            ),
+            None
+        );
+        assert_eq!(
+            linux_appimage_system_gtk_immodules_cache(
+                Some(OsStr::new("/tmp/DBX.AppImage")),
+                Some(OsStr::new("/tmp/.mount_DBX123")),
+                None,
+                Some(OsStr::new("/tmp/.mount_DBX123/usr/lib/x86_64-linux-gnu/gtk-3.0/3.0.0/immodules.cache")),
+                Some(TEST_GTK3_IMMODULES_CACHE),
+            ),
+            None
+        );
+        assert_eq!(
+            linux_appimage_system_gtk_immodules_cache(
+                Some(OsStr::new("/tmp/DBX.AppImage")),
+                Some(OsStr::new("/tmp/.mount_DBX123")),
+                Some(OsStr::new("fcitx5")),
+                Some(OsStr::new("/tmp/.mount_DBX123/usr/lib/x86_64-linux-gnu/gtk-3.0/3.0.0/immodules.cache")),
+                None,
+            ),
+            None
+        );
+    }
 }
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
@@ -348,8 +530,14 @@ pub fn run() {
 
             let default_data_dir =
                 app.path().app_data_dir().map_err(|e| e.to_string()).expect("Failed to resolve app data dir");
-            let data_dir = data_dir::resolve_data_dir(default_data_dir);
+            let data_dir_resolution = data_dir::resolve_data_dir_with_mode(default_data_dir);
+            let data_dir = data_dir_resolution.data_dir.clone();
             std::fs::create_dir_all(&data_dir).expect("Failed to create data dir");
+            let alternative_data_dir = data_dir::alternative_data_dir(&data_dir_resolution);
+            match maybe_import_user_data_db(&data_dir, alternative_data_dir.as_deref()) {
+                Ok(result) => eprintln!("[STARTUP] data db fallback import: {result:?}"),
+                Err(err) => eprintln!("[STARTUP] data db fallback import failed: {err}"),
+            }
             let db_path = data_dir.join("dbx.db");
 
             let t = Instant::now();
@@ -366,7 +554,7 @@ pub fn run() {
             apply_debug_log_level(desktop_settings.debug_logging_enabled);
             eprintln!("[STARTUP] storage ready in {:?}", t.elapsed());
 
-            let default_agent_dir = data_dir::uses_custom_data_dir().then(|| data_dir.join("agents"));
+            let default_agent_dir = data_dir_resolution.uses_custom_data_dir().then(|| data_dir.join("agents"));
             let (plugin_dir, agent_dir) = commands::app_settings::resolve_driver_store_dirs_from_settings(
                 &desktop_settings,
                 &data_dir,
@@ -422,8 +610,8 @@ pub fn run() {
                 }
                 let app = window.app_handle();
                 let Some(state) = app.try_state::<CloseBehaviorState>() else {
-                    let _ = window.hide();
                     api.prevent_close();
+                    hide_main_window_for_close(&app, window);
                     return;
                 };
                 if !state.prompted() {
@@ -435,8 +623,8 @@ pub fn run() {
                     app.exit(0);
                     return;
                 }
-                let _ = window.hide();
                 api.prevent_close();
+                hide_main_window_for_close(&app, window);
             }
         })
         .invoke_handler(tauri::generate_handler![
@@ -503,6 +691,7 @@ pub fn run() {
             commands::schema::get_object_source,
             commands::schema::list_schemas,
             commands::schema::list_schema_infos,
+            commands::schema::list_data_types,
             commands::schema::get_columns,
             commands::schema::list_indexes,
             commands::schema::list_foreign_keys,
@@ -566,6 +755,8 @@ pub fn run() {
             commands::query::build_data_grid_copy_insert_statement,
             commands::query::build_data_grid_context_filter_condition,
             commands::query::build_data_grid_column_value_filter_condition,
+            commands::query::build_data_grid_column_values_filter_condition,
+            commands::query::build_data_grid_column_distinct_values_sql,
             commands::query::build_data_grid_count_sql,
             commands::query::build_hive_table_properties_sql,
             commands::query::build_export_insert_statements,
@@ -639,6 +830,7 @@ pub fn run() {
             commands::nacos_cmd::nacos_update_instance,
             commands::nacos_cmd::nacos_raw_request,
             commands::saved_sql::load_saved_sql_library,
+            commands::saved_sql::load_saved_sql_file,
             commands::saved_sql::save_saved_sql_folder,
             commands::saved_sql::delete_saved_sql_folder,
             commands::saved_sql::save_saved_sql_file,
@@ -656,6 +848,7 @@ pub fn run() {
             commands::mongo_cmd::mongo_drop_collection,
             commands::mongo_cmd::document_find_documents,
             commands::mongo_cmd::mongo_find_documents,
+            commands::mongo_cmd::mongo_server_version,
             commands::mongo_cmd::mongo_aggregate_documents,
             commands::mongo_cmd::mongo_insert_document,
             commands::mongo_cmd::mongo_insert_documents,
@@ -751,6 +944,7 @@ pub fn run() {
             commands::mcp::install_mcp_server,
             commands::update::check_for_updates,
             commands::update::get_system_proxy_url,
+            commands::update::download_and_install_update,
             commands::transfer::start_transfer,
             commands::transfer::cancel_transfer,
             commands::database_export::export_database_sql,

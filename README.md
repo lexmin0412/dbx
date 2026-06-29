@@ -219,6 +219,17 @@ volumes:
 
 Open `http://localhost:4224` in your browser. Multi-arch images (amd64 / arm64) are available.
 
+To publish DBX under a reverse-proxy context path such as `/dbx`, set the
+runtime base path and proxy the same prefix to the container:
+
+```yaml
+environment:
+  - DBX_PUBLIC_BASE_PATH=/dbx
+```
+
+When building the frontend yourself with an absolute asset base, set
+`VITE_DBX_BASE_PATH=/dbx/` before `pnpm build`.
+
 ## Getting Started
 
 ### Prerequisites
@@ -246,9 +257,10 @@ No additional dependencies required.
 ### Development
 
 ```bash
-pnpm install
-pnpm dev:tauri
+make
 ```
+
+`make` installs root dependencies when needed and starts the local Tauri desktop development environment.
 
 > [!TIP]
 > DuckDB compilation takes a while. If you're not working on DuckDB features,
@@ -256,11 +268,11 @@ pnpm dev:tauri
 >
 > ```bash
 > # Fast checks (skip DuckDB)
-> cargo check --no-default-features
-> cargo test  --no-default-features
+> make cargo-check-fast
+> make cargo-test-fast
 >
 > # Tauri dev without DuckDB
-> pnpm tauri dev -- --no-default-features
+> make dev-fast
 > ```
 >
 > The `--no-default-features` flag only affects local development.
@@ -269,9 +281,17 @@ pnpm dev:tauri
 Web version:
 
 ```bash
-pnpm dev:web       # frontend
-pnpm dev:backend   # backend
+make dev-web       # frontend
+make dev-backend   # backend
 ```
+
+Documentation site:
+
+```bash
+make docs
+```
+
+The official DBX documentation site lives in `docs/`. If you want to improve the website content or documentation pages, edit the files under `docs/` and run `make docs` to preview the site locally.
 
 JDBC agent driver development projects live in `agents/`:
 
@@ -285,7 +305,7 @@ Build artifacts from `agents/drivers/<db-type>/build/libs/` are picked up by loc
 ### Build
 
 ```bash
-pnpm tauri build
+make package
 ```
 
 The installer will be in `src-tauri/target/release/bundle/`.
