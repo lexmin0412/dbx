@@ -63,4 +63,4 @@ portable/
 DBX_*_x64-portable.zip
 .agents/skills
 .pnpm-store/*
-.dbx-web
+.dbx-web.omo/
