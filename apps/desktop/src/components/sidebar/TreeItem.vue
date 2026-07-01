@@ -529,6 +529,12 @@ async function toggle() {
       const collectionRef = node.id.includes("__vector_collection:") ? node.id.split("__vector_collection:").pop() || node.label : node.label;
       const tab = queryStore.createTab(node.connectionId, node.database || "default", node.label, "vector");
       queryStore.updateSql(tab, collectionRef);
+      api
+        .vectorGetCollectionDetail(node.connectionId, node.database || "default", collectionRef)
+        .then((info) => {
+          if (info.dimension != null) node.meta = { dimension: info.dimension } as any;
+        })
+        .catch((e) => console.error("vector detail error:", e));
     } else if (node.type === "database" && node.connectionId && hasTreeNodeDatabaseContext(node)) {
       const config = connectionStore.getConfig(node.connectionId);
       const effectiveDbType = effectiveDatabaseTypeForConnection(config);

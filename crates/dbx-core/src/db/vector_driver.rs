@@ -241,27 +241,165 @@ async fn list_chroma_collections(client: &VectorClient) -> Result<Vec<Collection
     Ok(infos)
 }
 
+pub async fn get_collection_detail(client: &VectorClient, collection: &str) -> Result<CollectionInfo, String> {
+    match client.kind {
+        VectorDbKind::Qdrant => get_qdrant_collection_detail(client, collection).await,
+        VectorDbKind::Milvus => get_milvus_collection_detail(client, collection).await,
+        VectorDbKind::Weaviate => get_weaviate_collection_detail(client, collection).await,
+        VectorDbKind::ChromaDb => {
+            // ChromaDB list already includes dimension; re-list and find by name/uuid
+            let collections = list_chroma_collections(client).await?;
+            collections
+                .into_iter()
+                .find(|c| c.name == collection || c.id == collection)
+                .ok_or_else(|| format!("ChromaDB collection not found: {collection}"))
+        }
+    }
+}
+
+async fn get_qdrant_collection_detail(client: &VectorClient, collection: &str) -> Result<CollectionInfo, String> {
+    let body = send_json(client.get(&format!("/collections/{}", path_segment(collection))), "Qdrant").await?;
+    let dim = body
+        .pointer("/result/config/params/vectors/size")
+        .and_then(Value::as_u64)
+        .or_else(|| {
+            // Named vectors: pick the first one's size
+            body.pointer("/result/config/params/vectors")
+                .and_then(Value::as_object)
+                .and_then(|obj| obj.values().find_map(|v| v.get("size").and_then(|s| s.as_u64())))
+        })
+        .map(|d| d as u32);
+    Ok(CollectionInfo { name: collection.to_string(), id: collection.to_string(), dimension: dim })
+}
+
+fn milvus_vector_dim_from_field(field: &Value) -> Option<u32> {
+    // params can be a direct object: { "dim": 128 }
+    if let Some(dim) = field.pointer("/params/dim").and_then(Value::as_u64) {
+        return Some(dim as u32);
+    }
+    // or an array of key/value pairs: [{ "key": "dim", "value": "128" }]
+    if let Some(params) = field.get("params").and_then(Value::as_array) {
+        for param in params {
+            if param.get("key").and_then(Value::as_str) == Some("dim") {
+                if let Some(v) = param.get("value").and_then(Value::as_str) {
+                    return v.parse().ok();
+                }
+                if let Some(v) = param.get("value").and_then(Value::as_u64) {
+                    return Some(v as u32);
+                }
+            }
+        }
+    }
+    None
+}
+
+async fn get_milvus_collection_detail(client: &VectorClient, collection: &str) -> Result<CollectionInfo, String> {
+    let body = send_json(
+        client
+            .post("/v2/vectordb/collections/describe")
+            .json(&serde_json::json!({ "dbName": "default", "collectionName": collection })),
+        "Milvus",
+    )
+    .await?;
+    if body.get("code").and_then(Value::as_i64) != Some(0) {
+        let msg = body.get("message").and_then(Value::as_str).unwrap_or("unknown error");
+        return Err(format!("Milvus collection detail error: {msg}"));
+    }
+    let fields = body.pointer("/data/fields").and_then(Value::as_array);
+    let dim = fields
+        .and_then(|f| {
+            f.iter().find(|f| {
+                let t = f.get("type");
+                t.and_then(Value::as_str) == Some("FloatVector")
+                    || t.and_then(Value::as_str) == Some("BinaryVector")
+                    || t.and_then(Value::as_i64) == Some(101)
+                    || t.and_then(Value::as_i64) == Some(102)
+            })
+        })
+        .and_then(milvus_vector_dim_from_field);
+    Ok(CollectionInfo { name: collection.to_string(), id: collection.to_string(), dimension: dim })
+}
+
+async fn get_weaviate_collection_detail(_client: &VectorClient, collection: &str) -> Result<CollectionInfo, String> {
+    // Weaviate REST API does not expose vector dimension or any explicit vector
+    // configuration that reveals it. The dimension is determined internally by
+    // the vectorizer model or from the first inserted object.
+    Ok(CollectionInfo { name: collection.to_string(), id: collection.to_string(), dimension: None })
+}
+
 fn chroma_get_response_to_rows(body: &Value) -> Vec<Value> {
-    let ids = body.get("ids").and_then(Value::as_array).cloned().unwrap_or_default();
-    let docs = body.get("documents").and_then(Value::as_array).cloned().unwrap_or_default();
-    let metas = body.get("metadatas").and_then(Value::as_array).cloned().unwrap_or_default();
+    let raw_ids = body.get("ids").and_then(Value::as_array).cloned().unwrap_or_default();
+    let raw_docs = body.get("documents").and_then(Value::as_array).cloned().unwrap_or_default();
+    let raw_metas = body.get("metadatas").and_then(Value::as_array).cloned().unwrap_or_default();
+    let raw_dists = body.get("distances").and_then(Value::as_array).cloned().unwrap_or_default();
+
+    // ChromaDB query endpoint returns nested arrays (grouped by query),
+    // while get endpoint returns flat arrays.
+    let is_nested = raw_ids.first().and_then(|v| v.as_array()).is_some();
+
+    let ids: Vec<Value> = if is_nested {
+        raw_ids.iter().flat_map(|v| v.as_array().cloned().unwrap_or_default()).collect()
+    } else {
+        raw_ids
+    };
+    let documents: Vec<Value> = if is_nested {
+        raw_docs.iter().flat_map(|v| v.as_array().cloned().unwrap_or_default()).collect()
+    } else {
+        raw_docs
+    };
+    let metadatas: Vec<Value> = if is_nested {
+        raw_metas.iter().flat_map(|v| v.as_array().cloned().unwrap_or_default()).collect()
+    } else {
+        raw_metas
+    };
+    let distances: Vec<Value> = if is_nested {
+        raw_dists.iter().flat_map(|v| v.as_array().cloned().unwrap_or_default()).collect()
+    } else {
+        raw_dists
+    };
 
     ids.into_iter()
         .enumerate()
         .map(|(i, id_val)| {
             let mut row = serde_json::Map::new();
             row.insert("id".to_string(), id_val);
-            if let Some(doc) = docs.get(i) {
+            if let Some(doc) = documents.get(i) {
                 row.insert("document".to_string(), doc.clone());
             }
-            if let Some(Value::Object(meta_obj)) = metas.get(i) {
+            if let Some(Value::Object(meta_obj)) = metadatas.get(i) {
                 for (k, v) in meta_obj {
                     row.insert(k.clone(), v.clone());
                 }
             }
+            if let Some(dist) = distances.get(i) {
+                row.insert("distance".to_string(), dist.clone());
+            }
             Value::Object(row)
         })
         .collect()
+}
+
+fn weaviate_graphql_to_rows(body: &Value) -> Option<Vec<Value>> {
+    let get_obj = body.pointer("/data/Get")?.as_object()?;
+    let (_class_name, items) = get_obj.iter().next()?;
+    let items = items.as_array()?;
+    Some(
+        items
+            .iter()
+            .map(|item| {
+                let mut obj = match item {
+                    Value::Object(m) => m.clone(),
+                    _ => return item.clone(),
+                };
+                if let Some(Value::Object(additional)) = obj.remove("_additional") {
+                    for (k, v) in additional {
+                        obj.entry(k).or_insert(v);
+                    }
+                }
+                Value::Object(obj)
+            })
+            .collect(),
+    )
 }
 
 fn weaviate_collection_names_from_schema(body: &Value) -> Vec<String> {
@@ -472,6 +610,10 @@ fn json_to_query_result(status: u16, body: Value, start: Instant) -> QueryResult
     {
         let rows = chroma_get_response_to_rows(&body);
         return values_to_query_result(rows, start);
+    }
+    // Weaviate GraphQL search response
+    if let Some(items) = weaviate_graphql_to_rows(&body) {
+        return values_to_query_result(items, start);
     }
     QueryResult {
         columns: vec!["status".to_string(), "response".to_string()],

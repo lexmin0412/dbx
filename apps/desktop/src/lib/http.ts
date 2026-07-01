@@ -1740,6 +1740,10 @@ export async function vectorListCollections(connectionId: string, database?: str
   return mongoListCollections(connectionId, database || "default");
 }
 
+export async function vectorGetCollectionDetail(connectionId: string, database: string, collection: string): Promise<CollectionInfo> {
+  return post("/api/mongo/vector-collection-detail", { connectionId, database, collection });
+}
+
 export async function mongoFindDocuments(connectionId: string, database: string, collection: string, skip: number, limit: number, filter?: string, projection?: string, sort?: string, executionId?: string): Promise<MongoDocumentResult> {
   return post("/api/mongo/find-documents", { connectionId, database, collection, skip, limit, filter, projection, sort, executionId });
 }

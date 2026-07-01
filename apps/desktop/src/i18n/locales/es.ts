@@ -1825,8 +1825,9 @@ export default withEnglishFallback({
   vector: {
     collectionFallback: "colección",
     productCollection: "Colección de {product}",
-    browse: "Examinar",
-    upsert: "Upsert",
+    browse: "Explorar",
+    search: "Buscar",
+    upsert: "Actualizar/Insertar",
     delete: "Eliminar",
     reset: "Restablecer",
     refresh: "Actualizar",
@@ -1834,6 +1835,7 @@ export default withEnglishFallback({
     apply: "Aplicar",
     requestEditor: "Editor de solicitudes vectoriales",
     operationSuccess: "Operación completada. La vista previa de la colección se ha actualizado.",
+    vectorLabel: "Vector",
   },
   history: {
     title: "Historial",

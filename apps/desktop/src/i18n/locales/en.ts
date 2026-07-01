@@ -1836,6 +1836,7 @@ export default {
     collectionFallback: "collection",
     productCollection: "{product} collection",
     browse: "Browse",
+    search: "Search",
     upsert: "Upsert",
     delete: "Delete",
     reset: "Reset",
@@ -1844,6 +1845,7 @@ export default {
     apply: "Apply",
     requestEditor: "Vector request editor",
     operationSuccess: "Operation completed. The collection preview has been refreshed.",
+    vectorLabel: "Vector",
   },
   history: {
     title: "History",
