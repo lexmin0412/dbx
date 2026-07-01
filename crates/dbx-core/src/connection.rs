@@ -125,6 +125,7 @@ macro_rules! agent_connection_pool_database_type {
             | DatabaseType::Bigquery
             | DatabaseType::Kylin
             | DatabaseType::Sundb
+            | DatabaseType::Oscar
             | DatabaseType::Tdengine
             | DatabaseType::Xugu
             | DatabaseType::Iotdb
@@ -881,6 +882,7 @@ impl AppState {
                     &db_config.username,
                     &db_config.password,
                     db_config.database.as_deref(),
+                    db_config.url_params.as_deref(),
                     connect_timeout,
                 )
                 .await?;
@@ -1018,7 +1020,8 @@ impl AppState {
                 // connectivity via the mq_registry and insert a marker so this
                 // connection_id is recognized as valid.
                 let mqc = self.mq_admin_config_for_connection(connection_id, &config).await?;
-                let adapter = self.mq_registry.build_transient_config(mqc).await?;
+                let kafka_launch = crate::mq::service::resolve_kafka_launch_spec(&mqc, self);
+                let adapter = self.mq_registry.build_transient_config(mqc, kafka_launch).await?;
                 adapter.test_connection().await?;
                 PoolKind::MessageQueue
             }

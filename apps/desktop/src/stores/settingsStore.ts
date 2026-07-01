@@ -59,8 +59,10 @@ export type DesktopIconTheme = "default" | "black";
 export type InterfaceLayout = "separated" | "classic";
 
 export type UpdateDownloadSource = "official" | "cnb";
+export type SqlSemanticDiagnosticsMode = "auto" | "enabled" | "disabled";
 
 export const DEFAULT_SIDEBAR_TABLE_PAGE_SIZE = 1000;
+const SQL_SEMANTIC_DIAGNOSTICS_AUTO_ENABLED = false;
 
 export const DEFAULT_DESKTOP_SETTINGS: DesktopSettings = {
   show_tray_icon: true,
@@ -330,6 +332,8 @@ export interface EditorSettings {
   showExecutionTargetPicker: boolean;
   autoAliasTables: boolean;
   wordWrap: boolean;
+  sqlSemanticDiagnosticsMode: SqlSemanticDiagnosticsMode;
+  sqlSemanticDiagnosticsEnabled: boolean;
   confirmDangerousSqlExecution: boolean;
   compactTabTitle: boolean;
   appLayout: "separated" | "classic";
@@ -347,6 +351,7 @@ export interface EditorSettings {
   tableInfoDrawerWidth: number;
   cellDetailDrawerWidth: number;
   cellDetailPanelLayout: CellDetailPanelLayout;
+  cellDetailJsonFormatted: boolean;
   shortcuts: ShortcutSettings;
   sqlFormatter: SqlFormatterSettings;
   sidebarActivation: SidebarActivation;
@@ -436,6 +441,8 @@ export const DEFAULT_EDITOR_SETTINGS: EditorSettings = {
   showExecutionTargetPicker: false,
   autoAliasTables: true,
   wordWrap: false,
+  sqlSemanticDiagnosticsMode: "auto",
+  sqlSemanticDiagnosticsEnabled: SQL_SEMANTIC_DIAGNOSTICS_AUTO_ENABLED,
   confirmDangerousSqlExecution: true,
   compactTabTitle: false,
   appLayout: "classic",
@@ -453,6 +460,7 @@ export const DEFAULT_EDITOR_SETTINGS: EditorSettings = {
   tableInfoDrawerWidth: 320,
   cellDetailDrawerWidth: 380,
   cellDetailPanelLayout: "bottom",
+  cellDetailJsonFormatted: false,
   shortcuts: normalizeShortcutSettings(),
   sqlFormatter: normalizeSqlFormatterSettings(DEFAULT_SQL_FORMATTER_SETTINGS),
   sidebarActivation: "single",
@@ -512,6 +520,18 @@ function normalizeTableFontSize(value: unknown): number {
 
 function normalizeUpdateDownloadSource(value: unknown): UpdateDownloadSource {
   return value === "cnb" ? "cnb" : DEFAULT_EDITOR_SETTINGS.updateDownloadSource;
+}
+
+function normalizeSqlSemanticDiagnosticsMode(value: unknown, legacyEnabled?: unknown): SqlSemanticDiagnosticsMode {
+  if (value === "auto" || value === "enabled" || value === "disabled") return value;
+  if (typeof legacyEnabled === "boolean") return legacyEnabled ? "enabled" : "disabled";
+  return DEFAULT_EDITOR_SETTINGS.sqlSemanticDiagnosticsMode;
+}
+
+function sqlSemanticDiagnosticsEnabledForMode(mode: SqlSemanticDiagnosticsMode): boolean {
+  if (mode === "enabled") return true;
+  if (mode === "disabled") return false;
+  return SQL_SEMANTIC_DIAGNOSTICS_AUTO_ENABLED;
 }
 
 function normalizeDisconnectTabHandlingMode(value: unknown, legacyCloseTabsOnDisconnect?: unknown): DisconnectTabHandlingMode {
@@ -582,6 +602,7 @@ function normalizeToolbarItems(items: Partial<ToolbarItems> | undefined): Toolba
 }
 
 export function normalizeEditorSettings(settings: Partial<EditorSettings>, existing?: EditorSettings): EditorSettings {
+  const sqlSemanticDiagnosticsMode = normalizeSqlSemanticDiagnosticsMode(settings.sqlSemanticDiagnosticsMode, settings.sqlSemanticDiagnosticsEnabled);
   return {
     fontFamily: settings.fontFamily ?? DEFAULT_EDITOR_SETTINGS.fontFamily,
     fontSize: settings.fontSize ?? DEFAULT_EDITOR_SETTINGS.fontSize,
@@ -618,6 +639,8 @@ export function normalizeEditorSettings(settings: Partial<EditorSettings>, exist
     showExecutionTargetPicker: settings.showExecutionTargetPicker ?? DEFAULT_EDITOR_SETTINGS.showExecutionTargetPicker,
     autoAliasTables: settings.autoAliasTables ?? DEFAULT_EDITOR_SETTINGS.autoAliasTables,
     wordWrap: settings.wordWrap ?? DEFAULT_EDITOR_SETTINGS.wordWrap,
+    sqlSemanticDiagnosticsMode,
+    sqlSemanticDiagnosticsEnabled: sqlSemanticDiagnosticsEnabledForMode(sqlSemanticDiagnosticsMode),
     confirmDangerousSqlExecution: settings.confirmDangerousSqlExecution ?? DEFAULT_EDITOR_SETTINGS.confirmDangerousSqlExecution,
     compactTabTitle: settings.compactTabTitle ?? DEFAULT_EDITOR_SETTINGS.compactTabTitle,
     appLayout: settings.appLayout ?? DEFAULT_EDITOR_SETTINGS.appLayout,
@@ -635,6 +658,7 @@ export function normalizeEditorSettings(settings: Partial<EditorSettings>, exist
     tableInfoDrawerWidth: normalizeDrawerWidth(settings.tableInfoDrawerWidth, 240, DEFAULT_EDITOR_SETTINGS.tableInfoDrawerWidth),
     cellDetailDrawerWidth: normalizeDrawerWidth(settings.cellDetailDrawerWidth, 260, DEFAULT_EDITOR_SETTINGS.cellDetailDrawerWidth),
     cellDetailPanelLayout: normalizeCellDetailPanelLayout(settings.cellDetailPanelLayout),
+    cellDetailJsonFormatted: typeof settings.cellDetailJsonFormatted === "boolean" ? settings.cellDetailJsonFormatted : DEFAULT_EDITOR_SETTINGS.cellDetailJsonFormatted,
     shortcuts: normalizeShortcutSettings(settings.shortcuts),
     sqlFormatter: normalizeSqlFormatterSettings(settings.sqlFormatter),
     sidebarActivation: settings.sidebarActivation === "single" || settings.sidebarActivation === "double" ? settings.sidebarActivation : DEFAULT_EDITOR_SETTINGS.sidebarActivation,
@@ -791,6 +815,11 @@ export const useSettingsStore = defineStore("settings", () => {
     if (partial.showExecutionTargetPicker !== undefined) editorSettings.value.showExecutionTargetPicker = partial.showExecutionTargetPicker;
     if (partial.autoAliasTables !== undefined) editorSettings.value.autoAliasTables = partial.autoAliasTables;
     if (partial.wordWrap !== undefined) editorSettings.value.wordWrap = partial.wordWrap;
+    if (partial.sqlSemanticDiagnosticsMode !== undefined || partial.sqlSemanticDiagnosticsEnabled !== undefined) {
+      const nextMode = normalizeSqlSemanticDiagnosticsMode(partial.sqlSemanticDiagnosticsMode, partial.sqlSemanticDiagnosticsEnabled);
+      editorSettings.value.sqlSemanticDiagnosticsMode = nextMode;
+      editorSettings.value.sqlSemanticDiagnosticsEnabled = sqlSemanticDiagnosticsEnabledForMode(nextMode);
+    }
     if (partial.confirmDangerousSqlExecution !== undefined) editorSettings.value.confirmDangerousSqlExecution = partial.confirmDangerousSqlExecution;
     if (partial.compactTabTitle !== undefined) editorSettings.value.compactTabTitle = partial.compactTabTitle;
     if (partial.appLayout !== undefined) editorSettings.value.appLayout = partial.appLayout;
@@ -809,6 +838,7 @@ export const useSettingsStore = defineStore("settings", () => {
     if (partial.tableInfoDrawerWidth !== undefined) editorSettings.value.tableInfoDrawerWidth = normalizeDrawerWidth(partial.tableInfoDrawerWidth, 240, DEFAULT_EDITOR_SETTINGS.tableInfoDrawerWidth);
     if (partial.cellDetailDrawerWidth !== undefined) editorSettings.value.cellDetailDrawerWidth = normalizeDrawerWidth(partial.cellDetailDrawerWidth, 260, DEFAULT_EDITOR_SETTINGS.cellDetailDrawerWidth);
     if (partial.cellDetailPanelLayout !== undefined) editorSettings.value.cellDetailPanelLayout = normalizeCellDetailPanelLayout(partial.cellDetailPanelLayout);
+    if (partial.cellDetailJsonFormatted !== undefined) editorSettings.value.cellDetailJsonFormatted = partial.cellDetailJsonFormatted === true;
     if (partial.shortcuts !== undefined) editorSettings.value.shortcuts = normalizeShortcutSettings(partial.shortcuts);
     if (partial.sqlFormatter !== undefined) editorSettings.value.sqlFormatter = normalizeSqlFormatterSettings(partial.sqlFormatter);
     if (partial.sidebarActivation !== undefined) editorSettings.value.sidebarActivation = partial.sidebarActivation;

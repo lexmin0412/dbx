@@ -58,6 +58,7 @@ import { kvRootNodeLabel } from "@/lib/kvRootPresentation";
 import { REDIS_SCAN_PAGE_SIZE_DEFAULT } from "@/lib/redisKeyPattern";
 import { appendAgentDriverUpdateHint, hasAgentDriverUpdate, type AgentDriverInstallState } from "@/lib/agentDriverInstallHint";
 import i18n from "@/i18n";
+import type { MqAdminConfig } from "@/types/mq";
 
 const PINNED_TREE_NODES_STORAGE_KEY = "dbx-pinned-tree-nodes";
 const ACTIVE_CONNECTION_STORAGE_KEY = "dbx-active-connection";
@@ -75,6 +76,13 @@ function sidebarObjectGroupPageSize(): number {
   const size = settingsStore.desktopSettings.sidebar_table_page_size;
   return typeof size === "number" && size > 0 ? size : 500;
 }
+
+function isKafkaMqConnection(config: ConnectionConfig | undefined): boolean {
+  if (!config || config.db_type !== "mq") return false;
+  if (config.driver_profile === "kafka") return true;
+  return (config.external_config as Partial<MqAdminConfig> | undefined)?.systemKind === "kafka";
+}
+
 type ImportSource = "dbx" | "navicat" | "dbeaver" | "datagrip";
 
 interface LocateTableTarget {
@@ -127,12 +135,16 @@ function ensureSqlServerLinkedRootNode(connectionId: string, children: TreeNode[
 // Temporary storage for DataGrip import payload (used to read Keychain passwords after import)
 let pendingDataGripPayload: { format: "datagrip-import"; dataSources: string; dataSourcesLocal?: string } | null = null;
 
-interface TreeClipboardTableStructure {
-  kind: "table-structure";
+interface TreeClipboardTableEntry {
   connectionId: string;
   database: string;
   schema?: string;
   tableName: string;
+}
+
+export interface TreeClipboard {
+  kind: "table-copy";
+  tables: TreeClipboardTableEntry[];
 }
 
 interface LoadTreeOptions {
@@ -160,7 +172,7 @@ export const useConnectionStore = defineStore("connection", () => {
   const selectedTreeNodeId = ref<string | null>(null);
   const selectedTreeNodeIds = ref<string[]>([]);
   const treeSelectionAnchorId = ref<string | null>(null);
-  const treeClipboard = ref<TreeClipboardTableStructure | null>(null);
+  const treeClipboard = ref<TreeClipboard | null>(null);
 
   watch(activeConnectionId, (id) => {
     if (id) localStorage.setItem(ACTIVE_CONNECTION_STORAGE_KEY, id);
@@ -518,6 +530,7 @@ export const useConnectionStore = defineStore("connection", () => {
       bigquery: "BigQuery",
       kylin: "Kylin",
       sundb: "SunDB",
+      oscar: "神通 OSCAR",
       influxdb: "InfluxDB",
     };
 
@@ -597,7 +610,30 @@ export const useConnectionStore = defineStore("connection", () => {
     return pinnedTreeNodeIds.value.has(id);
   }
 
+  function isConnectionUtilityNode(node: TreeNode): boolean {
+    return node.type === "user-admin";
+  }
+
+  function connectionMetadataChildren(children: TreeNode[] | undefined): TreeNode[] {
+    return (children || []).filter((child) => !isConnectionUtilityNode(child));
+  }
+
+  function hasConnectionMetadataChildren(children: TreeNode[] | undefined): boolean {
+    return connectionMetadataChildren(children).length > 0;
+  }
+
+  function preserveExistingConnectionMetadataChildren(parent: TreeNode, children: TreeNode[]): TreeNode[] {
+    if (parent.type !== "connection" || hasConnectionMetadataChildren(children)) return children;
+
+    const existingMetadataChildren = connectionMetadataChildren(parent.children);
+    const nextUtilityChildren = children.filter(isConnectionUtilityNode);
+    if (existingMetadataChildren.length === 0 || nextUtilityChildren.length === 0) return children;
+
+    return [...existingMetadataChildren, ...nextUtilityChildren];
+  }
+
   function setChildren(parent: TreeNode, children: TreeNode[]) {
+    children = preserveExistingConnectionMetadataChildren(parent, children);
     if (parent.children && parent.children.length > 0) {
       const oldMap = new Map(parent.children.map((c) => [c.id, c] as const));
       children = children.map((child) => {
@@ -637,7 +673,7 @@ export const useConnectionStore = defineStore("connection", () => {
   }
 
   function withConnectionUtilityNodes(connectionId: string, children: TreeNode[], existingConnectionNode?: TreeNode): TreeNode[] {
-    const nonUtilityChildren = children.filter((child) => child.type !== "user-admin");
+    const nonUtilityChildren = connectionMetadataChildren(children);
     const userAdminNode = buildUserAdminNode(connectionId, existingConnectionNode);
     return [...nonUtilityChildren, userAdminNode].filter(Boolean) as TreeNode[];
   }
@@ -865,6 +901,9 @@ export const useConnectionStore = defineStore("connection", () => {
     const config = node.connectionId ? getConfig(node.connectionId) : undefined;
     const cachedChildren = normalizeCataloglessDatabaseNodes(expandCachedObjectBrowserNodes(decoded.children));
     const childrenWithLinkedServers = node.type === "connection" && node.connectionId ? ensureSqlServerLinkedRootNode(node.connectionId, cachedChildren, config) : cachedChildren;
+    if (node.type === "connection" && !hasConnectionMetadataChildren(childrenWithLinkedServers)) {
+      return { hit: false, isStale: false };
+    }
     const normalizedChildren = sortSidebarTreeChildrenForParent(node, childrenWithLinkedServers, config?.db_type);
     setChildren(node, node.type === "connection" && node.connectionId ? withSavedSqlRoot(node.connectionId, normalizedChildren, node) : normalizedChildren);
     node.isExpanded = true;
@@ -875,9 +914,19 @@ export const useConnectionStore = defineStore("connection", () => {
     await api.saveSchemaCache(cacheKey, encodeSchemaTreeCache(children)).catch(() => undefined);
   }
 
+  async function savePersistedConnectionTreeChildren(cacheKey: string, children: TreeNode[]) {
+    const metadataChildren = connectionMetadataChildren(children);
+    if (metadataChildren.length === 0) return;
+    await savePersistedTreeChildren(cacheKey, metadataChildren);
+  }
+
   function useCachedChildren(node: TreeNode, options?: LoadTreeOptions): boolean {
     if (options?.force || !loadedTreeNodeChildrenIds.value.has(node.id)) return false;
     if (node.type === "connection" && node.connectionId) {
+      if (!hasConnectionMetadataChildren(node.children)) {
+        clearLoadedChildrenCache(node.id);
+        return false;
+      }
       const normalizedChildren = sortSidebarTreeChildrenForParent(node, withSavedSqlRoot(node.connectionId, node.children || [], node), getConfig(node.connectionId)?.db_type);
       setChildren(node, normalizedChildren);
     }
@@ -1389,7 +1438,7 @@ export const useConnectionStore = defineStore("connection", () => {
         const children = withSavedSqlRoot(connectionId, buildDuckDbConnectionTreeNodes(connectionId, databases, schemas), node);
         if (isSidebarSearchQueryChanged(options)) return;
         setChildren(node, children);
-        await savePersistedTreeChildren(cacheKey, children);
+        await savePersistedConnectionTreeChildren(cacheKey, node.children || children);
       } else if (config && connectionUsesVisibleSchemaFilter(config)) {
         const schemaFilterConfig = config;
         const effectiveDb = schemaFilterConfig.database || "";
@@ -1415,7 +1464,7 @@ export const useConnectionStore = defineStore("connection", () => {
         }));
         if (isSidebarSearchQueryChanged(options)) return;
         setChildren(node, withSavedSqlRoot(connectionId, schemaNodes, node));
-        await savePersistedTreeChildren(cacheKey, schemaNodes);
+        await savePersistedConnectionTreeChildren(cacheKey, node.children || schemaNodes);
       } else {
         const cacheKey = schemaCacheKey(connectionId, "databases");
         if (!options?.force) {
@@ -1458,7 +1507,7 @@ export const useConnectionStore = defineStore("connection", () => {
         const children = withSavedSqlRoot(connectionId, databaseNodes, node);
         if (isSidebarSearchQueryChanged(options)) return;
         setChildren(node, children);
-        await savePersistedTreeChildren(cacheKey, children);
+        await savePersistedConnectionTreeChildren(cacheKey, node.children || children);
       }
       node.isExpanded = true;
     } catch (e) {
@@ -1589,18 +1638,34 @@ export const useConnectionStore = defineStore("connection", () => {
       await ensureConnected(connectionId);
       if (useCachedChildren(node, options)) return;
 
-      const tenants = await withMetadataLoadTimeout(connectionId, api.mqListTenants(connectionId), "message queue tenants");
-      const tenantNames = sortSidebarNames(tenants.map((tenant) => tenant.name).filter((name) => !!name.trim()));
-      setChildren(
-        node,
-        tenantNames.map((tenant) => ({
-          id: schemaCacheKey(connectionId, "mq-tenant", tenant),
-          label: tenant,
-          type: "mq-tenant" as const,
-          connectionId,
-          mqTenant: tenant,
-        })),
-      );
+      const config = getConfig(connectionId);
+      if (isKafkaMqConnection(config)) {
+        // Kafka has no tenant/namespace concept. Create a synthetic child
+        // that opens the MQ admin console directly when clicked.
+        setChildren(node, [
+          {
+            id: schemaCacheKey(connectionId, "mq-tenant", "_kafka"),
+            label: "Topics",
+            type: "mq-tenant" as const,
+            connectionId,
+            mqTenant: "_kafka",
+            mqInitialTab: "topics",
+          },
+        ]);
+      } else {
+        const tenants = await withMetadataLoadTimeout(connectionId, api.mqListTenants(connectionId), "message queue tenants");
+        const tenantNames = sortSidebarNames(tenants.map((tenant) => tenant.name).filter((name) => !!name.trim()));
+        setChildren(
+          node,
+          tenantNames.map((tenant) => ({
+            id: schemaCacheKey(connectionId, "mq-tenant", tenant),
+            label: tenant,
+            type: "mq-tenant" as const,
+            connectionId,
+            mqTenant: tenant,
+          })),
+        );
+      }
       node.isExpanded = true;
     } catch (e) {
       recordMetadataLoadError(connectionId, e);

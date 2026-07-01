@@ -39,9 +39,14 @@ public final class AgentProtocol {
     public static final String MONGO_METHOD_LIST_DATABASES = "list_databases";
     public static final String MONGO_METHOD_LIST_COLLECTIONS = "list_collections";
     public static final String MONGO_METHOD_FIND_DOCUMENTS = "find_documents";
+    /**
+     * MongoDB read path that returns documents as relaxed Extended JSON for transfer.
+     */
+    public static final String MONGO_METHOD_FIND_DOCUMENTS_EXTENDED_JSON = "find_documents_extended_json";
     public static final String MONGO_METHOD_SERVER_VERSION = "server_version";
     public static final String MONGO_METHOD_INSERT_DOCUMENT = "insert_document";
     public static final String MONGO_METHOD_UPDATE_DOCUMENT = "update_document";
+    public static final String MONGO_METHOD_UPDATE_DOCUMENTS = "update_documents";
     public static final String MONGO_METHOD_DELETE_DOCUMENT = "delete_document";
 
     public static final String KV_METHOD_LIST_PREFIX = "kv_list_prefix";
@@ -114,6 +119,7 @@ public final class AgentProtocol {
         MONGO_METHOD_LIST_DATABASES,
         MONGO_METHOD_LIST_COLLECTIONS,
         MONGO_METHOD_FIND_DOCUMENTS,
+        MONGO_METHOD_FIND_DOCUMENTS_EXTENDED_JSON,
         MONGO_METHOD_SERVER_VERSION,
         MONGO_METHOD_INSERT_DOCUMENT,
         MONGO_METHOD_UPDATE_DOCUMENT,
