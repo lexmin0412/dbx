@@ -578,6 +578,18 @@ async function toggle() {
       const collectionRef = node.id.includes("__vector_collection:") ? node.id.split("__vector_collection:").pop() || node.label : node.label;
       const tab = queryStore.createTab(node.connectionId, node.database || "default", node.label, "vector");
       queryStore.updateSql(tab, collectionRef);
+      api
+        .vectorGetCollectionDetail(node.connectionId, node.database || "default", collectionRef)
+        .then((info) => {
+          if (info.dimension != null) {
+            if (node.meta) {
+              (node.meta as Record<string, unknown>).dimension = info.dimension;
+            } else {
+              node.meta = { dimension: info.dimension } as any;
+            }
+          }
+        })
+        .catch(() => {});
     } else if (node.type === "database" && node.connectionId && hasTreeNodeDatabaseContext(node)) {
       const config = connectionStore.getConfig(node.connectionId);
       const effectiveDbType = effectiveDatabaseTypeForConnection(config);
@@ -4932,12 +4944,11 @@ function treeItemMenuItems(): ContextMenuItem[] {
 <style>
 .sidebar-object-comment {
   color: var(--muted-foreground);
-  font-family: "Microsoft YaHei UI", "Microsoft YaHei", "Segoe UI", system-ui, sans-serif;
-  font-size: 12px;
-  font-weight: 500;
-  line-height: 16px;
-  opacity: 1;
-  text-rendering: optimizeLegibility;
+  font-size: 10px;
+  line-height: 1rem;
+  opacity: 0.6;
+  /* Sidebar rows repaint on hover; avoid heavier font shaping and fallback here. */
+  text-rendering: auto;
 }
 
 .tree-item-connection-tint {
