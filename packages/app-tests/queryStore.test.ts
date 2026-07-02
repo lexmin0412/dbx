@@ -101,6 +101,22 @@ test("renames query tab titles", () => {
   assert.equal(tab?.customTitle, true);
 });
 
+test("closing an active data tab restores the previously focused query tab", () => {
+  setActivePinia(createPinia());
+  const store = useQueryStore();
+  const firstQueryId = store.createTab("conn-1", "db", "query_1", "query");
+  store.createTab("conn-1", "db", "query_2", "query");
+
+  store.activeTabId = firstQueryId;
+  const dataTabId = store.createTab("conn-1", "db", "public.users", "data", "public");
+
+  assert.equal(store.activeTabId, dataTabId);
+
+  store.closeTab(dataTabId);
+
+  assert.equal(store.activeTabId, firstQueryId);
+});
+
 test("linkExternalSqlPath records the local path and detaches saved SQL", () => {
   setActivePinia(createPinia());
   const store = useQueryStore();
@@ -2605,6 +2621,40 @@ test("query execution is scoped to the tab client session", async () => {
     await store.executeTabSql(tabId, "select 1");
 
     assert.equal(executeBody.clientSessionId, tabId);
+    assert.equal(executeBody.timeoutSecs, 30);
+  } finally {
+    globalThis.fetch = originalFetch;
+    restoreStorage();
+  }
+});
+
+test("data tab execution reuses the shared connection pool", async () => {
+  const restoreStorage = installMemoryStorage();
+  setActivePinia(createPinia());
+  const connectionStore = useConnectionStore();
+  const store = useQueryStore();
+  const originalFetch = globalThis.fetch;
+
+  connectionStore.addEphemeralConnection(conn("conn-1"));
+  const tabId = store.createTab("conn-1", "db", "users", "data", "public");
+  let executeBody: any;
+
+  globalThis.fetch = withConnectionHealthMock(async (input, init) => {
+    const url = String(input);
+    if (url === "/api/query/execute-multi") {
+      executeBody = JSON.parse(String(init?.body ?? "{}"));
+      return new Response(JSON.stringify([{ columns: ["id"], rows: [[1]], affected_rows: 0, execution_time_ms: 1 }]), {
+        status: 200,
+        headers: { "Content-Type": "application/json" },
+      });
+    }
+    return new Response("unexpected request", { status: 500 });
+  });
+
+  try {
+    await store.executeTabSql(tabId, "select * from users");
+
+    assert.equal(executeBody.clientSessionId, undefined);
     assert.equal(executeBody.timeoutSecs, 30);
   } finally {
     globalThis.fetch = originalFetch;

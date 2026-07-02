@@ -80,6 +80,7 @@ import { copyNameForTreeNode, objectSourceKindForTreeNode, sidebarSelectionCopyA
 import { formatSqlInsert } from "@/lib/exportFormats";
 import { joinExportedDdls } from "@/lib/ddlExport";
 import { fetchTableDataForExport } from "@/lib/tableDataExport";
+import { canActivateExistingDataTableTab } from "@/lib/dataTabActivation";
 import { buildCreateDatabaseSql, buildDuckDbAttachDatabaseSql, duckDbAttachedDatabaseNameFromPath, supportsCreateDatabaseCharset, uniqueDuckDbAttachedDatabaseName } from "@/lib/createDatabaseSql";
 import {
   buildCreateSchemaSql,
@@ -112,6 +113,7 @@ import { focusSidebarRenameInput } from "@/lib/sidebarRenameFocus";
 import { hasTreeNodeDatabaseContext } from "@/lib/treeNodeContext";
 import { defaultPasteTableMode, pasteTableModeCopiesData, supportsWholeRowTableDataCopy, tableClipboardMatchesTarget, tableDataCopyColumnOptions, type PasteTableMode, type TableClipboardContext } from "@/lib/tableClipboard";
 import { sidebarDisplayTableName } from "@/lib/sidebarTableNameDisplay";
+import { shouldMeasureSidebarLabelOverflow } from "@/lib/sidebarLabelTooltip";
 import { selectedTreeNodesInVisibleOrder as orderSelectedTreeNodes, treeSelectionRangeIdsByIndex, treeSelectionRangeIds } from "@/lib/sidebarTreeSelection";
 import { selectedConnectionDeleteTargets } from "@/lib/sidebarConnectionSelection";
 import { supportsDatabaseUserAdmin } from "@/lib/databaseUserAdmin";
@@ -143,12 +145,54 @@ import { createDatabaseCollationOptionsForCharset, fallbackCreateDatabaseCharset
 const { t } = useI18n();
 const labelRef = ref<HTMLElement>();
 const rowRef = ref<HTMLElement>();
-function isLabelTruncated(): boolean {
+const labelOverflowing = ref(false);
+let labelResizeObserver: ResizeObserver | null = null;
+let labelMeasureFrame = 0;
+
+function cancelLabelOverflowMeasure() {
+  if (!labelMeasureFrame) return;
+  window.cancelAnimationFrame(labelMeasureFrame);
+  labelMeasureFrame = 0;
+}
+
+function measureLabelOverflow(): boolean {
   const el = labelRef.value;
-  if (!el) return false;
+  if (!el || !shouldMeasureLabelOverflow()) return false;
   const style = window.getComputedStyle(el);
   if (style.overflowX === "visible" || style.textOverflow !== "ellipsis") return false;
   return el.scrollWidth - el.clientWidth > 2;
+}
+
+function updateLabelOverflow() {
+  labelOverflowing.value = measureLabelOverflow();
+}
+
+function scheduleLabelOverflowMeasure() {
+  if (typeof window === "undefined") {
+    updateLabelOverflow();
+    return;
+  }
+  cancelLabelOverflowMeasure();
+  // Keep synchronous layout reads out of the hover path; they are expensive in
+  // large virtualized sidebar trees, especially on Linux WebKitGTK without GPU help.
+  labelMeasureFrame = window.requestAnimationFrame(() => {
+    labelMeasureFrame = 0;
+    updateLabelOverflow();
+  });
+}
+
+function observeLabelOverflow() {
+  labelResizeObserver?.disconnect();
+  labelResizeObserver = null;
+  if (!shouldMeasureLabelOverflow()) {
+    labelOverflowing.value = false;
+    return;
+  }
+  if (typeof ResizeObserver !== "undefined" && labelRef.value) {
+    labelResizeObserver = new ResizeObserver(scheduleLabelOverflowMeasure);
+    labelResizeObserver.observe(labelRef.value);
+  }
+  scheduleLabelOverflowMeasure();
 }
 const connectionStore = useConnectionStore();
 const queryStore = useQueryStore();
@@ -175,6 +219,7 @@ const props = defineProps<{
 
 const emit = defineEmits<{
   "rename-started": [];
+  "group-created": [groupId: string];
   "node-toggled": [node: TreeNode, wasExpanded: boolean];
   "search-toggle": [node: TreeNode];
 }>();
@@ -437,7 +482,7 @@ const detailTooltip = computed(() => connectionInfoTooltip.value ?? objectCommen
 
 function isTooltipDisabled(): boolean {
   if (detailTooltip.value?.rows.length) return isRenamingGroup.value;
-  return isRenamingGroup.value || !isLabelTruncated();
+  return isRenamingGroup.value || !labelOverflowing.value;
 }
 
 async function toggle() {
@@ -951,12 +996,7 @@ async function openData() {
   const tableSchema = connectionObjectTreeNodeSchema(config, node.database, node.schema);
   const tableType = node.type === "view" ? "VIEW" : node.type === "materialized_view" ? "MATERIALIZED_VIEW" : (node.tableType ?? "TABLE");
   const isSameDataTableTab = (tab: (typeof queryStore.tabs)[number]) => tab.mode === "data" && tab.connectionId === node.connectionId && tab.database === node.database && (tab.schema || "") === (tableSchema || "") && (tab.tableMeta?.tableName || tab.title) === node.label;
-  const activateExistingSameTableTab = () => {
-    const existing = queryStore.tabs.find(isSameDataTableTab);
-    if (!existing) return false;
-    queryStore.activeTabId = existing.id;
-    return true;
-  };
+  const existingSameTableTab = queryStore.tabs.find(isSameDataTableTab);
   const resetReusedDataTabState = (tab: (typeof queryStore.tabs)[number]) => {
     tab.title = node.label;
     tab.schema = tableSchema;
@@ -979,12 +1019,18 @@ async function openData() {
     tab.queryEditabilityReason = undefined;
   };
 
-  if (activateExistingSameTableTab()) {
+  if (existingSameTableTab && canActivateExistingDataTableTab(existingSameTableTab)) {
+    queryStore.activeTabId = existingSameTableTab.id;
     logPhase("existing-tab-activated", { table: node.label });
     return;
   }
 
   const tabId = (() => {
+    if (existingSameTableTab) {
+      queryStore.activeTabId = existingSameTableTab.id;
+      resetReusedDataTabState(existingSameTableTab);
+      return existingSameTableTab.id;
+    }
     if (settingsStore.editorSettings.reuseDataTab) {
       const existing = queryStore.tabs.find((tab) => tab.mode === "data" && tab.connectionId === node.connectionId && tab.database === node.database);
       if (existing) {
@@ -1456,7 +1502,7 @@ async function duplicateConnection() {
   const config = connectionStore.getConfig(connId);
   if (!config) return;
   const newConfig = { ...config, id: uuid(), name: `${config.name} (Copy)` };
-  await connectionStore.addConnection(newConfig);
+  await connectionStore.addConnection(newConfig, connectionStore.groupIdForConnection(connId));
   toast(t("connection.duplicated"), 2000);
 }
 
@@ -3475,6 +3521,14 @@ const isRenamingGroup = ref(false);
 const renameInput = ref("");
 const renameInputRef = ref<HTMLInputElement>();
 
+function shouldMeasureLabelOverflow(): boolean {
+  return shouldMeasureSidebarLabelOverflow({
+    hasDetailTooltip: !!detailTooltip.value?.rows.length,
+    isRenaming: isRenamingGroup.value,
+    usesFullWidthLabel: usesFullWidthLabel.value,
+  });
+}
+
 function startRenameGroup() {
   renameInput.value = props.node.label;
   isRenamingGroup.value = true;
@@ -3492,6 +3546,14 @@ watch(
     }
   },
   { immediate: true },
+);
+
+watch(
+  [() => props.node.id, () => visibleLabel(props.node), () => usesFullWidthLabel.value, () => detailTooltip.value?.rows.length ?? 0, isRenamingGroup],
+  () => {
+    nextTick(observeLabelOverflow);
+  },
+  { flush: "post", immediate: true },
 );
 
 function finishRenameGroup() {
@@ -3520,6 +3582,7 @@ function newConnectionInGroup() {
 function newSubgroup() {
   const groupId = connectionStore.createConnectionGroup(t("connectionGroup.newGroupDefault"), props.node.id);
   connectionStore.selectedTreeNodeId = groupId;
+  emit("group-created", groupId);
 }
 
 function confirmDeleteGroup() {
@@ -3714,10 +3777,14 @@ function onRowMouseDown(event: MouseEvent) {
 }
 
 onMounted(() => {
+  observeLabelOverflow();
   window.addEventListener("dbx:sidebar-request-paste-table", onSidebarRequestPasteTable);
 });
 
 onBeforeUnmount(() => {
+  labelResizeObserver?.disconnect();
+  labelResizeObserver = null;
+  cancelLabelOverflowMeasure();
   window.removeEventListener("dbx:sidebar-request-paste-table", onSidebarRequestPasteTable);
   finishTableReferenceDrag();
 });
@@ -4066,6 +4133,10 @@ function treeItemMenuItems(): ContextMenuItem[] {
       items.push({ label: t("contextMenu.setDefaultDatabase"), action: setNodeAsDefaultDatabase, icon: Database });
     } else {
       items.push({ label: t("contextMenu.clearDefaultDatabase"), action: clearNodeDefaultDatabase, icon: Database });
+    }
+    if (node.type === "mongo-db") {
+      items.push({ label: "", separator: true });
+      items.push({ label: t("transfer.dataTransfer"), action: openTransfer, icon: ArrowRightLeft });
     }
     if (node.type === "redis-db") {
       items.push({ label: "", separator: true });
