@@ -1641,6 +1641,7 @@ export interface SqlFilePreview {
   filePath: string;
   sizeBytes: number;
   preview: string;
+  canExecuteWithoutSelectedDatabase: boolean;
 }
 
 export interface SqlFileProgress {
