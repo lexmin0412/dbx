@@ -3,7 +3,7 @@ import { computed, ref, nextTick, onBeforeUnmount, onMounted } from "vue";
 import { useI18n } from "vue-i18n";
 import { onClickOutside } from "@vueuse/core";
 import { DynamicScroller, DynamicScrollerItem, RecycleScroller } from "vue-virtual-scroller";
-import { Braces, Copy, Eye, FileText, Terminal, Trash2, Save, RefreshCw, Plus, Loader2, Pencil, WrapText, IndentIncrease, IndentDecrease, ArrowUp, ArrowDown, ArrowUpDown } from "@lucide/vue";
+import { Braces, Copy, Eye, FileText, Terminal, Trash2, Save, RefreshCw, Plus, Loader2, Pencil, WrapText, IndentIncrease, IndentDecrease, ArrowUp, ArrowDown, ArrowUpDown, Search } from "@lucide/vue";
 import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
 import { Badge } from "@/components/ui/badge";
@@ -78,6 +78,8 @@ const redisJsonWordWrap = ref(readRedisJsonWordWrap());
 const redisJsonHighlighter = ref<RedisJsonHighlighter>();
 const hashSortBy = ref<"field" | "value" | null>(null);
 const hashSortDir = ref<"asc" | "desc">("asc");
+const hashSearchQuery = ref("");
+const searchLoading = ref(false);
 
 function toggleHashSort(column: "field" | "value") {
   if (hashSortBy.value === column && hashSortDir.value === "desc") {
@@ -110,6 +112,45 @@ const hashCollectionRows = computed<RedisCollectionRow[]>(() =>
     value,
   })),
 );
+
+function redisGlobEscape(s: string): string {
+  return s.replace(/[*?[\]\\]/g, "\\$&");
+}
+
+let hashSearchTimer: ReturnType<typeof setTimeout> | null = null;
+
+function onHashSearchInput() {
+  if (hashSearchTimer) clearTimeout(hashSearchTimer);
+  hashSearchTimer = setTimeout(() => void onHashSearch(), 400);
+}
+
+function onHashSearchKeydown(event: KeyboardEvent) {
+  if (event.key === "Enter") {
+    if (hashSearchTimer) clearTimeout(hashSearchTimer);
+    hashSearchTimer = null;
+    void onHashSearch();
+    return;
+  }
+  if (event.key === "Escape") {
+    hashSearchQuery.value = "";
+  }
+}
+
+async function onHashSearch() {
+  const query = hashSearchQuery.value.trim();
+  if (!data.value || searchLoading.value) return;
+  searchLoading.value = true;
+  try {
+    const pattern = query ? `*${redisGlobEscape(query)}*` : undefined;
+    const result = await api.redisLoadMore(props.connectionId, props.db, props.keyRaw, "hash", 0, 1000, pattern);
+    const items = Array.isArray(result.value) ? result.value : [];
+    collectionItems.value = items;
+    scanCursor.value = result.scan_cursor ?? undefined;
+    clearSelectedMember();
+  } finally {
+    searchLoading.value = false;
+  }
+}
 
 const selectedMemberDetail = computed(() => formatRedisMemberDetail(selectedMemberRaw.value));
 const selectedMemberJsonDetail = computed(() => selectedMemberDetail.value.json ?? null);
@@ -803,6 +844,7 @@ onBeforeUnmount(() => {
   stopResizeMemberSheet();
   stopResizeHashColumns();
   stopResizeZsetColumns();
+  if (hashSearchTimer) clearTimeout(hashSearchTimer);
 });
 </script>
 
@@ -969,7 +1011,11 @@ onBeforeUnmount(() => {
       <!-- Hash -->
       <div v-else-if="data.key_type === 'hash'" ref="hashTableRef" class="flex-1 flex flex-col overflow-hidden">
         <div class="flex items-center gap-2 px-4 py-1.5 border-b shrink-0">
-          <span class="text-xs text-muted-foreground">{{ collectionCountLabel("fields", collectionItems.length, data.total) }}</span>
+          <span class="text-xs text-muted-foreground shrink-0">{{ collectionCountLabel("fields", collectionItems.length, data.total) }}</span>
+          <div class="relative flex-1 max-w-60">
+            <Search class="pointer-events-none absolute left-1.5 top-1/2 h-3 w-3 -translate-y-1/2 text-muted-foreground/80" />
+            <Input v-model="hashSearchQuery" class="h-6 w-full pl-5 pr-2 text-xs" :placeholder="t('redis.searchFields')" @input="onHashSearchInput" @keydown="onHashSearchKeydown" />
+          </div>
           <span class="flex-1" />
           <Input v-model="newField" class="h-6 w-24 text-xs" placeholder="field" />
           <Input v-model="newValue" class="h-6 w-32 text-xs" placeholder="value" @keydown.enter="hashSet" />

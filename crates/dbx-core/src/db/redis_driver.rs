@@ -1758,7 +1758,7 @@ where
         }
         "hash" => {
             let len: u64 = redis::cmd("HLEN").arg(key).query_async(con).await.unwrap_or(0);
-            let (next_cursor, items) = hscan_page_raw(con, key, 0, COLLECTION_PAGE_SIZE).await?;
+            let (next_cursor, items) = hscan_page_raw(con, key, 0, COLLECTION_PAGE_SIZE, None).await?;
             let cursor = if next_cursor > 0 { Some(next_cursor) } else { None };
             (serde_json::Value::Array(items), false, Some(len), cursor)
         }
@@ -2204,6 +2204,7 @@ pub async fn load_more_collection<C>(
     key_type: &str,
     cursor: u64,
     count: usize,
+    match_pattern: Option<&str>,
 ) -> Result<RedisValue, String>
 where
     C: ConnectionLike + Send + Sync + Unpin,
@@ -2230,9 +2231,23 @@ where
             (serde_json::Value::Array(items), cursor)
         }
         "hash" => {
-            let (next, items) = hscan_page_raw(con, key, cursor, count).await?;
-            let cursor = if next > 0 { Some(next) } else { None };
-            (serde_json::Value::Array(items), cursor)
+            if let Some(pattern) = match_pattern {
+                let mut all_items = Vec::new();
+                let mut cur = cursor;
+                loop {
+                    let (next, items) = hscan_page_raw(con, key, cur, count, Some(pattern)).await?;
+                    all_items.extend(items);
+                    if next == 0 {
+                        break;
+                    }
+                    cur = next;
+                }
+                (serde_json::Value::Array(all_items), None)
+            } else {
+                let (next, items) = hscan_page_raw(con, key, cursor, count, None).await?;
+                let cursor = if next > 0 { Some(next) } else { None };
+                (serde_json::Value::Array(items), cursor)
+            }
         }
         _ => return Err(format!("Pagination not supported for type: {key_type}")),
     };
@@ -2254,18 +2269,17 @@ async fn hscan_page_raw<C>(
     key: &[u8],
     cursor: u64,
     count: usize,
+    match_pattern: Option<&str>,
 ) -> Result<(u64, Vec<serde_json::Value>), String>
 where
     C: ConnectionLike + Send + Sync + Unpin,
 {
-    let raw: RedisRawValue = redis::cmd("HSCAN")
-        .arg(key)
-        .arg(cursor)
-        .arg("COUNT")
-        .arg(count)
-        .query_async(con)
-        .await
-        .map_err(|e| e.to_string())?;
+    let mut cmd = redis::cmd("HSCAN");
+    cmd.arg(key).arg(cursor).arg("COUNT").arg(count);
+    if let Some(pattern) = match_pattern {
+        cmd.arg("MATCH").arg(pattern);
+    }
+    let raw: RedisRawValue = cmd.query_async(con).await.map_err(|e| e.to_string())?;
     parse_scan_pairs(raw, "hash")
 }
 
