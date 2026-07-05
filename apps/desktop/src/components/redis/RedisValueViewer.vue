@@ -79,6 +79,7 @@ const redisJsonHighlighter = ref<RedisJsonHighlighter>();
 const hashSortBy = ref<"field" | "value" | null>(null);
 const hashSortDir = ref<"asc" | "desc">("asc");
 const hashSearchQuery = ref("");
+const activeHashSearchQuery = ref("");
 const searchLoading = ref(false);
 
 function toggleHashSort(column: "field" | "value") {
@@ -117,7 +118,12 @@ function redisGlobEscape(s: string): string {
   return s.replace(/[*?[\]\\]/g, "\\$&");
 }
 
+function hashSearchPattern(query: string): string | undefined {
+  return query ? `*${redisGlobEscape(query)}*` : undefined;
+}
+
 let hashSearchTimer: ReturnType<typeof setTimeout> | null = null;
+let hashSearchRequestId = 0;
 
 function onHashSearchInput() {
   if (hashSearchTimer) clearTimeout(hashSearchTimer);
@@ -132,23 +138,28 @@ function onHashSearchKeydown(event: KeyboardEvent) {
     return;
   }
   if (event.key === "Escape") {
+    if (hashSearchTimer) clearTimeout(hashSearchTimer);
+    hashSearchTimer = null;
     hashSearchQuery.value = "";
+    void onHashSearch();
   }
 }
 
 async function onHashSearch() {
   const query = hashSearchQuery.value.trim();
-  if (!data.value || searchLoading.value) return;
+  if (!data.value) return;
+  const requestId = ++hashSearchRequestId;
   searchLoading.value = true;
   try {
-    const pattern = query ? `*${redisGlobEscape(query)}*` : undefined;
-    const result = await api.redisLoadMore(props.connectionId, props.db, props.keyRaw, "hash", 0, 1000, pattern);
+    const result = await api.redisLoadMore(props.connectionId, props.db, props.keyRaw, "hash", 0, 200, hashSearchPattern(query));
+    if (requestId !== hashSearchRequestId) return;
     const items = Array.isArray(result.value) ? result.value : [];
+    activeHashSearchQuery.value = query;
     collectionItems.value = items;
     scanCursor.value = result.scan_cursor ?? undefined;
     clearSelectedMember();
   } finally {
-    searchLoading.value = false;
+    if (requestId === hashSearchRequestId) searchLoading.value = false;
   }
 }
 
@@ -282,6 +293,12 @@ function collectionCountLabel(kind: "items" | "fields" | "members", loaded: numb
 
 async function load(options: { selectDefaultMember?: boolean } = {}) {
   const shouldSelectDefaultMember = options.selectDefaultMember ?? true;
+  if (hashSearchTimer) clearTimeout(hashSearchTimer);
+  hashSearchTimer = null;
+  hashSearchRequestId++;
+  hashSearchQuery.value = "";
+  activeHashSearchQuery.value = "";
+  searchLoading.value = false;
   loading.value = true;
   try {
     const loadedValue = await api.redisGetValue(props.connectionId, props.db, props.keyRaw);
@@ -307,10 +324,14 @@ async function load(options: { selectDefaultMember?: boolean } = {}) {
 }
 
 async function loadMore() {
-  if (!data.value || !hasMore.value || loadingMore.value) return;
+  if (!data.value || !hasMore.value || loadingMore.value || (data.value.key_type === "hash" && searchLoading.value)) return;
+  const keyType = data.value.key_type;
+  const hashFilter = keyType === "hash" ? hashSearchPattern(activeHashSearchQuery.value) : undefined;
+  const requestId = hashSearchRequestId;
   loadingMore.value = true;
   try {
-    const result = await api.redisLoadMore(props.connectionId, props.db, props.keyRaw, data.value.key_type, scanCursor.value!, 200);
+    const result = await api.redisLoadMore(props.connectionId, props.db, props.keyRaw, keyType, scanCursor.value!, 200, hashFilter);
+    if (keyType === "hash" && requestId !== hashSearchRequestId) return;
     const newItems = Array.isArray(result.value) ? result.value : [];
     collectionItems.value = [...collectionItems.value, ...newItems];
     scanCursor.value = result.scan_cursor ?? undefined;
@@ -1011,7 +1032,7 @@ onBeforeUnmount(() => {
       <!-- Hash -->
       <div v-else-if="data.key_type === 'hash'" ref="hashTableRef" class="flex-1 flex flex-col overflow-hidden">
         <div class="flex items-center gap-2 px-4 py-1.5 border-b shrink-0">
-          <span class="text-xs text-muted-foreground shrink-0">{{ collectionCountLabel("fields", collectionItems.length, data.total) }}</span>
+          <span class="text-xs text-muted-foreground shrink-0">{{ collectionCountLabel("fields", collectionItems.length, activeHashSearchQuery ? null : data.total) }}</span>
           <div class="relative flex-1 max-w-60">
             <Search class="pointer-events-none absolute left-1.5 top-1/2 h-3 w-3 -translate-y-1/2 text-muted-foreground/80" />
             <Input v-model="hashSearchQuery" class="h-6 w-full pl-5 pr-2 text-xs" :placeholder="t('redis.searchFields')" @input="onHashSearchInput" @keydown="onHashSearchKeydown" />
@@ -1074,7 +1095,7 @@ onBeforeUnmount(() => {
           </template>
           <template #after>
             <div v-if="hasMore" class="p-2">
-              <Button variant="outline" size="sm" class="w-full h-7 text-xs" :disabled="loadingMore" @click="loadMore">
+              <Button variant="outline" size="sm" class="w-full h-7 text-xs" :disabled="loadingMore || searchLoading" @click="loadMore">
                 <Loader2 v-if="loadingMore" class="w-3 h-3 mr-1.5 animate-spin" />
                 {{ t("redis.loadMoreKeys") }}
               </Button>
