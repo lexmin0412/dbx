@@ -52,4 +52,20 @@ describe("queryStore switchTab", () => {
     // Active tab should be the new tab
     expect(queryStore.activeTabId).toBe(tab2Id);
   });
+
+  it("deactivates settings page when reopening an existing special tab", async () => {
+    const { useQueryStore } = await import("@/stores/queryStore");
+    const { useSettingsStore } = await import("@/stores/settingsStore");
+    const queryStore = useQueryStore();
+    const settingsStore = useSettingsStore();
+
+    const tabId = queryStore.openObjectBrowser("pg-1", "app", "public");
+    settingsStore.settingsPageActive = true;
+
+    const reopenedTabId = queryStore.openObjectBrowser("pg-1", "app", "public");
+
+    expect(reopenedTabId).toBe(tabId);
+    expect(queryStore.activeTabId).toBe(tabId);
+    expect(settingsStore.settingsPageActive).toBe(false);
+  });
 });
