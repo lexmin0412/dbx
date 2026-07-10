@@ -303,6 +303,7 @@ function getI18nT() {
 
 export const useQueryStore = defineStore("query", () => {
   const t = getI18nT();
+  const settingsStore = useSettingsStore();
   const tabs = ref<QueryTab[]>([]);
   const activeTabId = ref<string | null>(null);
   const isOpenTabsLoaded = ref(false);
@@ -836,6 +837,11 @@ export const useQueryStore = defineStore("query", () => {
     tabs.value.push(tab);
     activeTabId.value = id;
     return id;
+  }
+
+  function switchTab(tabId: string) {
+    activeTabId.value = tabId;
+    settingsStore.settingsPageActive = false;
   }
 
   function openUserAdmin(connectionId: string) {
@@ -3278,6 +3284,7 @@ export const useQueryStore = defineStore("query", () => {
     hasDirtyTabs,
     isConfirmingAppClose,
     createTab,
+    switchTab,
     closeTab,
     forceClosePendingTab,
     forceCloseAllPendingTabs,
