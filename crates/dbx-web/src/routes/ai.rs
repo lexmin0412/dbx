@@ -10,7 +10,8 @@ use serde::Deserialize;
 use dbx_core::agent_events::AgentEvent;
 use dbx_core::agent_loop::{run_agent_loop, AgentLoopContext};
 use dbx_core::ai::{
-    AiCompletionRequest, AiConfig, AiConversation, AiModelInfo, AiProvider, AiStreamChunk, AiTestConnectionResult,
+    AiCompletionRequest, AiConfig, AiConfigItem, AiConversation, AiModelInfo, AiProvider, AiStreamChunk,
+    AiTestConnectionResult,
 };
 use dbx_core::models::connection::DatabaseType;
 
@@ -138,6 +139,65 @@ pub async fn load_ai_provider_configs(
 ) -> Result<Json<HashMap<String, AiConfig>>, AppError> {
     let configs = state.app.storage.load_ai_provider_configs().await.map_err(AppError)?;
     Ok(Json(configs))
+}
+
+// ---------------------------------------------------------------------------
+// Multi-config
+// ---------------------------------------------------------------------------
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SaveAiConfigsRequest {
+    pub configs: Vec<AiConfigItem>,
+}
+
+pub async fn save_ai_configs(
+    State(state): State<Arc<WebState>>,
+    Json(body): Json<SaveAiConfigsRequest>,
+) -> Result<Json<()>, AppError> {
+    state.app.storage.save_ai_configs(&body.configs).await.map_err(AppError)?;
+    Ok(Json(()))
+}
+
+pub async fn load_ai_configs(State(state): State<Arc<WebState>>) -> Result<Json<Vec<AiConfigItem>>, AppError> {
+    let configs = state.app.storage.load_ai_configs().await.map_err(AppError)?;
+    Ok(Json(configs))
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SetDefaultAiConfigRequest {
+    pub config_id: String,
+}
+
+pub async fn set_default_ai_config(
+    State(state): State<Arc<WebState>>,
+    Json(body): Json<SetDefaultAiConfigRequest>,
+) -> Result<Json<()>, AppError> {
+    state.app.storage.set_default_ai_config(&body.config_id).await.map_err(AppError)?;
+    Ok(Json(()))
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SaveAiConfigItemRequest {
+    pub config: AiConfigItem,
+}
+
+pub async fn save_ai_config_item(
+    State(state): State<Arc<WebState>>,
+    Json(body): Json<SaveAiConfigItemRequest>,
+) -> Result<Json<()>, AppError> {
+    state.app.storage.save_ai_config_item(&body.config).await.map_err(AppError)?;
+    Ok(Json(()))
+}
+
+pub async fn delete_ai_config(
+    State(state): State<Arc<WebState>>,
+    Path(config_id): Path<String>,
+) -> Result<Json<()>, AppError> {
+    state.app.storage.delete_ai_config(&config_id).await.map_err(AppError)?;
+    Ok(Json(()))
 }
 
 // ---------------------------------------------------------------------------

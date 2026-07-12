@@ -9,7 +9,7 @@ use reqwest::{header, Client, Method, StatusCode, Url};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
-use crate::ai::AiConfig;
+use crate::ai::AiConfigItem;
 use crate::connection_secrets::{
     MQ_AUTH_API_KEY_VALUE_KEY, MQ_AUTH_CLIENT_SECRET_KEY, MQ_AUTH_PASSWORD_KEY, MQ_AUTH_TOKEN_KEY,
     MQ_TOKEN_SIGNING_KEY, NACOS_AUTH_PASSWORD_KEY,
@@ -119,7 +119,11 @@ pub struct EncryptedSecretsBlob {
 #[serde(rename_all = "camelCase")]
 pub struct SensitiveSyncPayload {
     pub connection_secrets: Vec<ConnectionSecretSnapshot>,
-    pub ai_config: Option<AiConfig>,
+    #[serde(default)]
+    pub ai_configs: Vec<AiConfigItem>,
+    /// Legacy field, used only for deserializing old data; not serialized
+    #[serde(default, skip_serializing)]
+    pub ai_config: Option<crate::ai::AiConfig>,
     /// Full tunnel profiles including their secrets.
     #[serde(default)]
     pub tunnel_profiles: Option<Vec<TransportLayerConfig>>,
@@ -664,7 +668,8 @@ async fn build_sensitive_payload(
 
     Ok(SensitiveSyncPayload {
         connection_secrets,
-        ai_config: storage.load_ai_config().await?,
+        ai_configs: storage.load_ai_configs().await.unwrap_or_default(),
+        ai_config: None,
         tunnel_profiles: Some(tunnel_profiles.to_vec()),
     })
 }
@@ -784,8 +789,19 @@ async fn apply_sensitive_payload(storage: &Storage, payload: &SensitiveSyncPaylo
         }
         storage.set_secret(&secret.connection_id, &secret.key, &secret.secret).await?;
     }
-    if let Some(ai_config) = &payload.ai_config {
-        storage.save_ai_config(ai_config).await?;
+    if !payload.ai_configs.is_empty() {
+        // New format: save directly
+        storage.save_ai_configs(&payload.ai_configs).await?;
+    } else if let Some(old_config) = &payload.ai_config {
+        // Legacy format: migrate then save
+        let provider_name = old_config.provider.as_str().to_string();
+        let item = AiConfigItem {
+            id: AiConfigItem::new_id(),
+            name: provider_name,
+            is_default: true,
+            config: old_config.clone(),
+        };
+        storage.save_ai_config_item(&item).await?;
     }
     if let Some(profiles) = &payload.tunnel_profiles {
         storage.save_tunnel_profiles(profiles).await?;
@@ -1310,6 +1326,7 @@ mod tests {
                     secret: "hop-secret".to_string(),
                 },
             ],
+            ai_configs: vec![],
             ai_config: None,
         };
         let encrypted = encrypt_sensitive_payload(&payload, "sync-pass").unwrap();
@@ -1328,6 +1345,7 @@ mod tests {
                 key: "password".to_string(),
                 secret: "secret".to_string(),
             }],
+            ai_configs: vec![],
             ai_config: None,
         };
         let encrypted = encrypt_sensitive_payload(&payload, "sync-pass").unwrap();

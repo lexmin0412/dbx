@@ -1123,6 +1123,26 @@ export async function loadAiConfig(): Promise<AiConfig | null> {
   return get("/api/ai/config");
 }
 
+export async function saveAiConfigs(configs: import("@/types/ai").AiConfigItem[]): Promise<void> {
+  return post("/api/ai/configs", { configs });
+}
+
+export async function loadAiConfigs(): Promise<import("@/types/ai").AiConfigItem[]> {
+  return get("/api/ai/configs");
+}
+
+export async function setDefaultAiConfig(configId: string): Promise<void> {
+  return post("/api/ai/default-config", { configId });
+}
+
+export async function saveAiConfigItem(config: import("@/types/ai").AiConfigItem): Promise<void> {
+  return post("/api/ai/config-item", { config });
+}
+
+export async function deleteAiConfig(configId: string): Promise<void> {
+  return del(`/api/ai/config/${configId}`);
+}
+
 export async function loadDesktopSettings(): Promise<DesktopSettings> {
   try {
     const raw = safeLocalStorageGet(DESKTOP_SETTINGS_STORAGE_KEY);
