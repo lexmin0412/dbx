@@ -889,7 +889,7 @@ export const useSettingsStore = defineStore("settings", () => {
     if (isAiConfigLoaded.value) return;
 
     // 尝试加载新格式
-    const newConfigs = await api.loadAiConfigs().catch(() => []);
+    const newConfigs = await api.loadAiConfigs();
 
     if (newConfigs.length > 0) {
       aiConfigs.value = newConfigs;
@@ -944,8 +944,8 @@ export const useSettingsStore = defineStore("settings", () => {
   }
 
   async function createAiConfig(config: AiConfigItem): Promise<void> {
-    aiConfigs.value.push(config);
     await api.saveAiConfigItem(config);
+    aiConfigs.value.push(config);
     if (aiConfigs.value.length === 1) {
       activeModel.value = { configId: config.id, modelId: config.model };
     }
@@ -954,21 +954,22 @@ export const useSettingsStore = defineStore("settings", () => {
   async function updateAiConfigItem(id: string, config: Partial<AiConfigItem>): Promise<void> {
     const index = aiConfigs.value.findIndex((c) => c.id === id);
     if (index !== -1) {
-      aiConfigs.value[index] = { ...aiConfigs.value[index], ...config };
-      await api.saveAiConfigItem(aiConfigs.value[index]);
+      const updated = { ...aiConfigs.value[index], ...config };
+      await api.saveAiConfigItem(updated);
+      aiConfigs.value[index] = updated;
     }
   }
 
   async function deleteAiConfig(id: string): Promise<void> {
-    aiConfigs.value = aiConfigs.value.filter((c) => c.id !== id);
     await api.deleteAiConfig(id);
+    aiConfigs.value = aiConfigs.value.filter((c) => c.id !== id);
   }
 
   async function setDefaultAiConfig(id: string): Promise<void> {
+    await api.setDefaultAiConfig(id);
     aiConfigs.value.forEach((c) => {
       c.isDefault = c.id === id;
     });
-    await api.setDefaultAiConfig(id);
   }
 
   function updateActiveModel(model: { configId: string; modelId: string }) {
