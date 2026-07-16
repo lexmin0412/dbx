@@ -97,3 +97,36 @@ test("setDefaultAiConfig succeeds -> isDefault flipped", async () => {
   assert.ok(!store.aiConfigs.find((c: any) => c.id === "c1")!.isDefault);
   assert.ok(store.aiConfigs.find((c: any) => c.id === "c2")!.isDefault);
 });
+
+test("reloadAiConfigs resets and reloads from API", async () => {
+  setActivePinia(createPinia());
+  const store = useSettingsStore();
+  store.aiConfigs.push({ id: "old", name: "stale", isDefault: true } as any);
+
+  apiMock.loadAiConfigs.mockResolvedValueOnce([
+    { id: "fresh", name: "fresh", isDefault: true } as any,
+  ]);
+
+  await store.reloadAiConfigs();
+  assert.equal(store.aiConfigs.length, 1);
+  assert.equal(store.aiConfigs[0].id, "fresh");
+  assert.equal(store.activeModel?.configId, "fresh");
+});
+
+test("reloadAiConfigs falls back when active config was deleted", async () => {
+  setActivePinia(createPinia());
+  const store = useSettingsStore();
+
+  // Simulate post-sync: activeModel points to a config no longer in ai_configs
+  store.aiConfigs.push({ id: "remaining", name: "r", model: "m", isDefault: true } as any);
+  store.activeModel = { configId: "deleted", modelId: "gone" };
+
+  apiMock.loadAiConfigs.mockResolvedValueOnce([
+    { id: "remaining", name: "r", model: "m", isDefault: true } as any,
+  ]);
+
+  await store.reloadAiConfigs();
+  assert.equal(store.aiConfigs.length, 1);
+  // activeModel should fall back to the first (and only) remaining config
+  assert.equal(store.activeModel?.configId, "remaining");
+});

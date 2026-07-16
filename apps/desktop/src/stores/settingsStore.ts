@@ -907,6 +907,19 @@ export const useSettingsStore = defineStore("settings", () => {
     isAiConfigLoaded.value = true;
   }
 
+  async function reloadAiConfigs(): Promise<void> {
+    isAiConfigLoaded.value = false;
+    await initAiConfigs();
+    // If the active config was deleted, fall back to the default
+    if (activeModel.value && !aiConfigs.value.find((c) => c.id === activeModel.value!.configId)) {
+      if (aiConfigs.value.length > 0) {
+        activeModel.value = { configId: aiConfigs.value[0].id, modelId: aiConfigs.value[0].model };
+      } else {
+        activeModel.value = null;
+      }
+    }
+  }
+
   async function migrateToMultiConfig(): Promise<void> {
     const oldActiveConfig = await api.loadAiConfig().catch(() => null);
     const oldProviderConfigs = await api.loadAiProviderConfigs().catch(() => null);
@@ -1123,6 +1136,7 @@ export const useSettingsStore = defineStore("settings", () => {
     isAiConfigLoaded,
     aiConfigs,
     initAiConfigs,
+    reloadAiConfigs,
     migrateToMultiConfig,
     createAiConfig,
     updateAiConfigItem,

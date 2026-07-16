@@ -155,6 +155,9 @@ pub async fn save_ai_configs(
     State(state): State<Arc<WebState>>,
     Json(body): Json<SaveAiConfigsRequest>,
 ) -> Result<Json<()>, AppError> {
+    for item in &body.configs {
+        reject_web_unsupported_ai_provider(&item.config)?;
+    }
     state.app.storage.save_ai_configs(&body.configs).await.map_err(AppError)?;
     Ok(Json(()))
 }
@@ -188,6 +191,7 @@ pub async fn save_ai_config_item(
     State(state): State<Arc<WebState>>,
     Json(body): Json<SaveAiConfigItemRequest>,
 ) -> Result<Json<()>, AppError> {
+    reject_web_unsupported_ai_provider(&body.config.config)?;
     state.app.storage.save_ai_config_item(&body.config).await.map_err(AppError)?;
     Ok(Json(()))
 }
@@ -385,4 +389,52 @@ pub async fn ai_agent_stream(
     };
 
     Ok(Sse::new(stream).keep_alive(KeepAlive::default()))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::reject_web_unsupported_ai_provider;
+    use dbx_core::ai::{AiApiStyle, AiAuthMethod, AiConfig, AiProvider, AiReasoningLevel};
+
+    fn make_config(provider: AiProvider) -> AiConfig {
+        AiConfig {
+            provider,
+            api_key: String::new(),
+            auth_method: AiAuthMethod::Bearer,
+            endpoint: "https://example.com".to_string(),
+            model: "test".to_string(),
+            models: vec![],
+            api_style: AiApiStyle::Completions,
+            proxy_enabled: false,
+            proxy_url: String::new(),
+            enable_thinking: true,
+            reasoning_level: AiReasoningLevel::Default,
+            context_window: None,
+            codex_cli_path: None,
+            codex_cli_env: Default::default(),
+        }
+    }
+
+    #[test]
+    fn rejects_codex_cli_single() {
+        let config = make_config(AiProvider::CodexCli);
+        assert!(reject_web_unsupported_ai_provider(&config).is_err());
+    }
+
+    #[test]
+    fn allows_other_providers_single() {
+        for provider in &[
+            AiProvider::Claude,
+            AiProvider::Openai,
+            AiProvider::OpenaiCompatible,
+            AiProvider::Custom,
+            AiProvider::Gemini,
+            AiProvider::Deepseek,
+            AiProvider::Qwen,
+            AiProvider::Ollama,
+        ] {
+            let config = make_config(provider.clone());
+            assert!(reject_web_unsupported_ai_provider(&config).is_ok(), "provider {:?} should be allowed", provider);
+        }
+    }
 }

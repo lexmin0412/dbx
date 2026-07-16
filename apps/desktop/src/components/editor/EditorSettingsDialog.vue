@@ -1610,6 +1610,7 @@ async function downloadSnippetSnapshot() {
     // Snapshot downloads replace backend-managed tunnel profiles, so refresh
     // the already-loaded Pinia store instead of leaving the UI stale.
     await tunnelProfileStore.refresh();
+    await settingsStore.reloadAiConfigs();
     let message = t("settings.syncSnippetDownloadSuccess", { bytes: result.summary.bytes, id: result.summary.snippetId });
     if (result.applySummary.encryptedSecretsPresent && !result.applySummary.secretsApplied) message += ` ${t("settings.syncSecretsSkipped")}`;
     if (result.applySummary.secretsApplied) message += ` ${t("settings.syncSecretsApplied")}`;
@@ -1748,6 +1749,7 @@ async function downloadWebDavSnapshot() {
     await savedSqlStore.initFromStorage();
     // Keep the shared tunnel profile UI consistent with the downloaded snapshot.
     await tunnelProfileStore.refresh();
+    await settingsStore.reloadAiConfigs();
     const message = t("settings.syncDownloadSuccess", {
       bytes: result.summary.bytes,
       path: result.summary.remotePath,

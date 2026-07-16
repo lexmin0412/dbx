@@ -857,6 +857,9 @@ impl Storage {
                 )
                 .map_err(|e| e.to_string())?;
             }
+            // Clear old single-config tables — migration is complete, avoids re-migration on empty ai_configs
+            tx.execute("DELETE FROM ai_config", []).map_err(|e| e.to_string())?;
+            tx.execute("DELETE FROM ai_provider_configs", []).map_err(|e| e.to_string())?;
             tx.commit().map_err(|e| e.to_string())?;
             Ok(())
         })
@@ -3907,6 +3910,32 @@ mod tests {
 
         let loaded = storage.load_ai_configs().await.unwrap();
         assert_eq!(loaded.len(), 3);
+
+        std::fs::remove_file(&db).ok();
+    }
+
+    #[tokio::test]
+    async fn ai_config_save_configs_clears_old_tables() {
+        let db = temp_db_path("ai-clear-old");
+        let storage = Storage::open(&db).await.unwrap();
+
+        // Pre-populate old tables as if migration hasn't run yet
+        storage.save_ai_config(&make_ai_config("legacy-active", false).config).await.unwrap();
+        storage.save_ai_provider_config("openai", &make_ai_config("legacy-openai", false).config).await.unwrap();
+
+        // save_ai_configs should clear old tables
+        let configs = vec![make_ai_config("new-a", true)];
+        storage.save_ai_configs(&configs).await.unwrap();
+
+        // New table has the saved config
+        let loaded = storage.load_ai_configs().await.unwrap();
+        assert_eq!(loaded.len(), 1);
+        assert_eq!(loaded[0].name, "new-a");
+
+        // Old tables are cleared — prevents re-migration on restart
+        assert!(storage.load_ai_config().await.unwrap().is_none(), "ai_config should be deleted");
+        let old_providers = storage.load_ai_provider_configs().await.unwrap();
+        assert!(old_providers.is_empty(), "ai_provider_configs should be deleted");
 
         std::fs::remove_file(&db).ok();
     }
