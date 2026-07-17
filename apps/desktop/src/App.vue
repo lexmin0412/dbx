@@ -91,7 +91,7 @@ import { detectDatabaseFileType } from "@/lib/database/databaseFileDetection";
 import { Dialog, DialogContent, DialogFooter, DialogHeader, DialogTitle } from "@/components/ui/dialog";
 import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
-import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from "@/components/ui/select";
+import { SearchableSelect } from "@/components/ui/searchable-select";
 import type { HistoryEntry } from "@/lib/backend/tauri";
 import type { AiAction } from "@/lib/ai/ai";
 
@@ -895,6 +895,40 @@ async function saveActiveObjectSource(tab: QueryTab): Promise<boolean> {
   } catch (e: any) {
     toast(t("objects.sourceSaveFailed", { message: e?.message || String(e) }), 5000);
     return false;
+  }
+}
+
+function saveSqlFolderDisplayName(id: string) {
+  if (id === ROOT_SAVED_SQL_FOLDER) return t("savedSql.rootFolder");
+  const folder = saveSqlFolders.value.find((f) => f.id === id);
+  return folder?.displayName ?? id;
+}
+
+function saveSqlFolderNormalizeCustom(value: string) {
+  const trimmed = value.trim();
+  if (!trimmed) return trimmed;
+  const folder = saveSqlFolders.value.find((f) => f.displayName === trimmed);
+  return folder ? folder.id : trimmed;
+}
+
+async function handleSaveSqlFolderSelect(value: string) {
+  if (value === ROOT_SAVED_SQL_FOLDER) {
+    saveSqlFolderId.value = value;
+    return;
+  }
+  const isExisting = saveSqlFolders.value.some((f) => f.id === value);
+  if (isExisting) {
+    saveSqlFolderId.value = value;
+    return;
+  }
+  const tab = activeTab.value;
+  if (!tab) return;
+  try {
+    const folder = await savedSqlStore.createFolder(tab.connectionId, value);
+    saveSqlFolderId.value = folder.id;
+  } catch (e: any) {
+    saveSqlFolderId.value = ROOT_SAVED_SQL_FOLDER;
+    toast(t("savedSql.createFolderFailed", { message: e?.message || String(e) }), 5000);
   }
 }
 
@@ -2269,17 +2303,24 @@ onUnmounted(() => {
             </div>
             <div class="space-y-1.5">
               <label class="text-xs font-medium text-muted-foreground">{{ t("savedSql.folder") }}</label>
-              <Select v-model="saveSqlFolderId">
-                <SelectTrigger class="h-8 w-full">
-                  <SelectValue />
-                </SelectTrigger>
-                <SelectContent position="popper">
-                  <SelectItem :value="ROOT_SAVED_SQL_FOLDER">{{ t("savedSql.rootFolder") }}</SelectItem>
-                  <SelectItem v-for="folder in saveSqlFolders" :key="folder.id" :value="folder.id">
-                    {{ folder.displayName }}
-                  </SelectItem>
-                </SelectContent>
-              </Select>
+              <SearchableSelect
+                :model-value="saveSqlFolderId"
+                :options="[ROOT_SAVED_SQL_FOLDER, ...saveSqlFolders.map((f) => f.id)]"
+                :display-name="saveSqlFolderDisplayName"
+                :normalize-custom="saveSqlFolderNormalizeCustom"
+                :placeholder="t('savedSql.folderPlaceholder')"
+                :search-placeholder="t('savedSql.searchPlaceholder')"
+                :empty-text="t('common.noResults')"
+                allow-custom
+                trigger-variant="outline"
+                trigger-class="h-8 w-full max-w-none text-sm"
+                content-class="w-[var(--reka-popover-trigger-width)]"
+                @update:model-value="handleSaveSqlFolderSelect"
+              >
+                <template #custom-option-label="{ value }">
+                  <span class="truncate">{{ t("savedSql.createFolderOption", { name: value }) }}</span>
+                </template>
+              </SearchableSelect>
             </div>
           </div>
           <DialogFooter>
