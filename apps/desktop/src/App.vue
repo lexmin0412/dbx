@@ -32,6 +32,7 @@ import { useVisibilityChange } from "@/composables/useVisibilityChange";
 import { useWebDavAutoUpload } from "@/composables/useWebDavAutoUpload";
 import { useScheduledDatabaseBackups } from "@/composables/useScheduledDatabaseBackups";
 import { shouldDrawDesktopWindowFrame } from "@/composables/useWindowControls";
+import { useSaveSqlFolderSelection } from "@/composables/useSaveSqlFolderSelection";
 import "@/i18n";
 import { translateBackendError } from "@/i18n/backend-errors";
 import * as api from "@/lib/backend/api";
@@ -167,13 +168,13 @@ const queryEditorDdlTarget = ref<{ connectionId: string; database: string; catal
 const queryEditorObjectSourceTarget = ref<{ connectionId: string; database: string; schema?: string; name: string; objectType: ObjectSourceKind; initialEditing: boolean } | null>(null);
 const showSaveSqlDialog = ref(false);
 const saveSqlName = ref("");
-const saveSqlFolderId = ref("");
+const ROOT_SAVED_SQL_FOLDER = "__root__";
+const { selection: saveSqlFolderId, pending: saveSqlFolderCreationPending, reset: resetSaveSqlFolderSelection, invalidate: invalidateSaveSqlFolderSelection, select: selectSaveSqlFolder } = useSaveSqlFolderSelection(ROOT_SAVED_SQL_FOLDER);
 const pendingSaveAndCloseTabId = ref<string | null>(null);
 const pendingPrevActiveTabId = ref<string | null>(null);
 const pendingSaveShouldCloseTab = ref(true);
 const pendingAppCloseAction = ref<AppCloseAction | null>(null);
 const pendingCloseActionChoice = ref(false);
-const ROOT_SAVED_SQL_FOLDER = "__root__";
 
 const activeTab = computed(() => queryStore.tabs.find((t) => t.id === queryStore.activeTabId));
 
@@ -635,6 +636,7 @@ function closePendingSavedTab() {
 }
 
 function cancelPendingSaveAndClose() {
+  invalidateSaveSqlFolderSelection();
   showSaveSqlDialog.value = false;
   pendingSaveAndCloseTabId.value = null;
   pendingPrevActiveTabId.value = null;
@@ -823,7 +825,7 @@ async function handleSaveTab(tabId: string) {
   const prevActive = queryStore.activeTabId;
   queryStore.activeTabId = tabId;
   saveSqlName.value = defaultSavedSqlName(tab.title);
-  saveSqlFolderId.value = ROOT_SAVED_SQL_FOLDER;
+  resetSaveSqlFolderSelection(ROOT_SAVED_SQL_FOLDER);
   pendingSaveAndCloseTabId.value = tabId;
   pendingPrevActiveTabId.value = prevActive;
   showSaveSqlDialog.value = true;
@@ -855,7 +857,7 @@ async function openSaveSqlDialog() {
   }
 
   saveSqlName.value = defaultSavedSqlName(tab.title);
-  saveSqlFolderId.value = ROOT_SAVED_SQL_FOLDER;
+  resetSaveSqlFolderSelection(ROOT_SAVED_SQL_FOLDER);
   showSaveSqlDialog.value = true;
 }
 
@@ -912,27 +914,22 @@ function saveSqlFolderNormalizeCustom(value: string) {
 }
 
 async function handleSaveSqlFolderSelect(value: string) {
-  if (value === ROOT_SAVED_SQL_FOLDER) {
-    saveSqlFolderId.value = value;
-    return;
-  }
-  const isExisting = saveSqlFolders.value.some((f) => f.id === value);
+  const isExisting = value === ROOT_SAVED_SQL_FOLDER || saveSqlFolders.value.some((f) => f.id === value);
   if (isExisting) {
-    saveSqlFolderId.value = value;
+    await selectSaveSqlFolder(value);
     return;
   }
   const tab = activeTab.value;
   if (!tab) return;
-  try {
-    const folder = await savedSqlStore.createFolder(tab.connectionId, value);
-    saveSqlFolderId.value = folder.id;
-  } catch (e: any) {
-    saveSqlFolderId.value = ROOT_SAVED_SQL_FOLDER;
-    toast(t("savedSql.createFolderFailed", { message: e?.message || String(e) }), 5000);
-  }
+  await selectSaveSqlFolder(
+    value,
+    async () => (await savedSqlStore.createFolder(tab.connectionId, value)).id,
+    (error: any) => toast(t("savedSql.createFolderFailed", { message: error?.message || String(error) }), 5000),
+  );
 }
 
 async function confirmSaveSqlToLibrary() {
+  if (saveSqlFolderCreationPending.value) return;
   const tab = activeTab.value;
   const name = saveSqlName.value.trim();
   if (!tab || !tab.sql.trim() || !name) return;
@@ -963,6 +960,7 @@ async function saveActiveSqlAsLocalFile() {
     const path = await api.saveExternalSqlFile(defaultSavedSqlName(tab.title), tab.sql);
     if (!path) return;
     queryStore.linkExternalSqlPath(tab.id, path, sqlFileTitleFromPath(path));
+    invalidateSaveSqlFolderSelection();
     showSaveSqlDialog.value = false;
     closePendingSavedTab();
     toast(t("savedSql.saved"), 2000);
@@ -2288,7 +2286,10 @@ onUnmounted(() => {
         @update:open="
           (open: boolean) => {
             showSaveSqlDialog = open;
-            if (!open && pendingSaveAndCloseTabId) cancelPendingSaveAndClose();
+            if (!open) {
+              invalidateSaveSqlFolderSelection();
+              if (pendingSaveAndCloseTabId) cancelPendingSaveAndClose();
+            }
           }
         "
       >
@@ -2311,6 +2312,7 @@ onUnmounted(() => {
                 :placeholder="t('savedSql.folderPlaceholder')"
                 :search-placeholder="t('savedSql.searchPlaceholder')"
                 :empty-text="t('common.noResults')"
+                :disabled="saveSqlFolderCreationPending"
                 allow-custom
                 trigger-variant="outline"
                 trigger-class="h-8 w-full max-w-none text-sm"
@@ -2326,7 +2328,7 @@ onUnmounted(() => {
           <DialogFooter>
             <Button v-if="isDesktop" variant="secondary" @click="saveActiveSqlAsLocalFile">{{ t("savedSql.saveToFile") }}</Button>
             <Button variant="outline" @click="cancelPendingSaveAndClose()">{{ t("dangerDialog.cancel") }}</Button>
-            <Button :disabled="!saveSqlName.trim()" @click="confirmSaveSqlToLibrary">{{ t("savedSql.save") }}</Button>
+            <Button :disabled="saveSqlFolderCreationPending || !saveSqlName.trim()" @click="confirmSaveSqlToLibrary">{{ t("savedSql.save") }}</Button>
           </DialogFooter>
         </DialogContent>
       </Dialog>
